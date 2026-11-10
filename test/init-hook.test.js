@@ -18,6 +18,8 @@ describe('bus init', () => {
     assert.deepEqual(s.permissions, { allow: ['Bash(ls)'] });
     assert.equal(s.hooks.PreToolUse.length, 2);
     assert.equal(s.hooks.PreToolUse[1].matcher, 'Edit|Write|MultiEdit|NotebookEdit');
+    assert.equal(s.hooks.PostToolUse[0].matcher, '*');
+    assert.match(s.hooks.PostToolUse[0].hooks[0].command, / hook post$/);
   });
 
   test('mergeClaudeMd appends once and replaces between markers', () => {
@@ -54,8 +56,8 @@ describe('PreToolUse edit guard', () => {
   after(async () => { await srv.close(); fs.rmSync(repo, { recursive: true, force: true }); });
 
   // Async spawn: spawnSync would block this process's event loop, and with it the in-process server.
-  const run = (env, input) => new Promise((ok) => {
-    const p = spawn(process.execPath, [BIN, 'hook', 'pre'], {
+  const run = (env, input, sub = 'pre') => new Promise((ok) => {
+    const p = spawn(process.execPath, [BIN, 'hook', sub], {
       env: { ...process.env, BUS_AGENT: '', BUS_TEAM: '', BUS_URL: `http://127.0.0.1:${port}`, ...env },
     });
     let stdout = '', stderr = '';
@@ -83,5 +85,33 @@ describe('PreToolUse edit guard', () => {
       run({}, edit(path.join(repo, 'src', 'api', 'u.ts'))),
       run({ BUS_AGENT: 'bob', BUS_TEAM: 'be', BUS_URL: 'http://127.0.0.1:1' }, edit(path.join(repo, 'src', 'api', 'u.ts'))),
     ])) { assert.equal(r.status, 0); assert.equal(r.stdout + r.stderr, ''); }
+  });
+
+  describe('PostToolUse notice', () => {
+    const post = (env) => run(env, { tool_name: 'Bash', tool_input: { command: 'ls' } }, 'post');
+    const carol = { BUS_AGENT: 'carol', BUS_TEAM: 'qa' };
+
+    test('silent when nothing is waiting, without identity, or with the server down', async () => {
+      srv.bus.touch('carol', 'qa');
+      srv.bus.read('carol');
+      for (const r of await Promise.all([post(carol), post({}), post({ ...carol, BUS_URL: 'http://127.0.0.1:1' })])) {
+        assert.equal(r.status, 0);
+        assert.equal(r.stdout + r.stderr, '');
+      }
+    });
+
+    test('one additionalContext line per new batch, then silent until something newer', async () => {
+      srv.bus.send('alice', '@carol', 'hi');
+      srv.bus.send('alice', '@qa', 'team ping');
+      const first = await post(carol);
+      const out = JSON.parse(first.stdout);
+      assert.equal(out.hookSpecificOutput.hookEventName, 'PostToolUse');
+      assert.match(out.hookSpecificOutput.additionalContext, /^bus: 2 new for you \(from @alice\) — run: bus read$/);
+      assert.equal((await post(carol)).stdout, ''); // ignored notice is not repeated
+      srv.bus.send('alice', '@carol', 'again');
+      assert.match(JSON.parse((await post(carol)).stdout).hookSpecificOutput.additionalContext, /3 new/);
+      srv.bus.read('carol');
+      assert.equal((await post(carol)).stdout, '');
+    });
   });
 });

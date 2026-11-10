@@ -1,17 +1,41 @@
 // Local HTTP server (127.0.0.1 only). Identity comes from x-bus-agent / x-bus-team / x-bus-cwd headers;
 // no x-bus-agent means the human ("you").
 import http from 'node:http';
+import fs from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { Bus, BusError, HUMAN, cleanName } from './bus.js';
 import { Store } from './store.js';
+import { Tasks } from './tasks.js';
 
 export const DEFAULT_PORT = 4477;
 const MAX_BODY = 256 * 1024;
 const MAX_WAIT_S = 3600;
 
-export function createServer({ dataFile = null, port = DEFAULT_PORT, host = '127.0.0.1' } = {}) {
+export function createServer({
+  dataFile = null, port = DEFAULT_PORT, host = '127.0.0.1',
+  inactiveMs = (Number(process.env.BUS_INACTIVE_MIN) || 30) * 60_000,
+} = {}) {
   const store = new Store(dataFile);
   const bus = new Bus(store);
+  const tasks = new Tasks(bus);
   const waiters = new Map(); // agent -> Set<fn>
+
+  // Dashboard live updates (SSE). Any state change -> one debounced "change" event; clients refetch /api/state.
+  const sse = new Set();
+  let changeTimer = null;
+  store.onChange = () => {
+    if (!sse.size || changeTimer) return;
+    changeTimer = setTimeout(() => {
+      changeTimer = null;
+      for (const res of sse) res.write(`event: change\ndata: ${bus.s.seq}\n\n`);
+    }, 100);
+  };
+  const heartbeat = setInterval(() => { for (const res of sse) res.write(': ping\n\n'); }, 25_000);
+  heartbeat.unref();
+
+  // Inactivity: agents blocked in `bus wait` are busy, not silent.
+  const sweeper = setInterval(() => bus.sweep(inactiveMs, new Set(waiters.keys())), Math.min(60_000, inactiveMs));
+  sweeper.unref();
 
   bus.on('message', () => {
     for (const [name, set] of waiters) {
@@ -25,14 +49,31 @@ export function createServer({ dataFile = null, port = DEFAULT_PORT, host = '127
     'POST /api/send': ({ who, body }) => ({ message: bus.send(who, body.to, body.text) }),
     'POST /api/read': ({ who }) => bus.read(need(who)),
     'GET /api/pending': ({ who }) => ({ pending: bus.pending(need(who)) }),
+    'GET /api/notice': ({ who }) => ({ notice: bus.notice(need(who)) }),
     'GET /api/show': ({ q }) => ({ message: bus.show(q.get('id')) }),
     'GET /api/log': ({ who, q }) => bus.channelLog(who, q.get('channel'), q.get('n')),
     'POST /api/claim': ({ who, body }) => bus.claim(need(who), arr(body.paths), body.why),
-    'POST /api/release': ({ who, body }) => bus.release(need(who), arr(body.paths), !!body.all),
+    'POST /api/release': ({ who, body }) => (body.of
+      ? bus.releaseOf(who, body.of, arr(body.paths), !!body.all)
+      : bus.release(need(who), arr(body.paths), !!body.all)),
     'GET /api/claims': ({ who, q }) => ({ claims: bus.claims(q.get('mine') ? who : null) }),
-    'GET /api/check': ({ who, q }) => bus.check(who, q.get('path') || ''),
+    'GET /api/check': ({ who, q }) => bus.check(who, q.get('path') || '', { editing: !!q.get('edit') }),
+    'POST /api/hot': ({ who, body }) => ({ hotFiles: body.rm ? bus.hotRm(who, arr(body.paths)) : bus.hotAdd(who, arr(body.paths)) }),
+    'POST /api/request': ({ who, body }) => ({ request: bus.request(need(who), body.file, body.text) }),
+    'POST /api/request/resolve': ({ who, body }) => ({ request: bus.resolveRequest(who, body.id, body.verdict, body.why) }),
+    'POST /api/iface': ({ who, body }) => ({ interfaces: body.rm ? bus.ifaceRm(who, body.path) : bus.ifaceAdd(who, body.path, arr(body.teams)) }),
     'GET /api/state': () => bus.s,
     'POST /api/wait': waitRoute,
+    'POST /api/task/add': ({ who, body }) => ({ task: tasks.add(who, { ...body, files: arr(body.files), after: arr(body.after) }) }),
+    'GET /api/task/list': ({ who, q }) => ({ tasks: tasks.list(who, !!q.get('mine')) }),
+    'GET /api/task/show': ({ q }) => ({ task: tasks.get(q.get('id')) }),
+    'POST /api/task/take': ({ who, body }) => ({ task: tasks.take(need(who), body.id) }),
+    'POST /api/task/done': ({ who, body }) => tasks.done(need(who), body.id, body.summary),
+    'POST /api/task/merged': ({ who, body }) => ({ task: tasks.merged(who, body.id) }),
+    'POST /api/task/reassign': ({ who, body }) => ({ task: tasks.reassign(who, body.id, body.to) }),
+    'POST /api/task/drop': ({ who, body }) => ({ task: tasks.drop(who, body.id) }),
+    'POST /api/approve': ({ who, body }) => ({ task: tasks.approve(who, body.id) }),
+    'POST /api/reject': ({ who, body }) => ({ task: tasks.reject(who, body.id, body.why) }),
   };
 
   function waitRoute({ who, q, res }) {
@@ -60,7 +101,14 @@ export function createServer({ dataFile = null, port = DEFAULT_PORT, host = '127
       const url = new URL(req.url, 'http://x');
       const route = routes[`${req.method} ${url.pathname}`];
       if (!route) {
-        if (req.method === 'GET' && url.pathname === '/') return send(res, 200, 'Agentic Chat bus is running. Dashboard: coming in build step 6.\n', 'text/plain');
+        if (req.method === 'GET' && url.pathname === '/') return send(res, 200, dashboardHtml(), 'text/html');
+        if (req.method === 'GET' && url.pathname === '/api/events') {
+          res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
+          res.write(`event: change\ndata: ${bus.s.seq}\n\n`);
+          sse.add(res);
+          req.on('close', () => sse.delete(res));
+          return;
+        }
         throw new BusError(`no route ${req.method} ${url.pathname}`, 404);
       }
       const who = cleanName(hdr(req, 'x-bus-agent')) || HUMAN;
@@ -77,10 +125,16 @@ export function createServer({ dataFile = null, port = DEFAULT_PORT, host = '127
   server.headersTimeout = 30_000;
 
   return {
-    bus, store, server,
+    bus, tasks, store, server,
     listen: () => new Promise((ok, fail) => { server.once('error', fail); server.listen(port, host, () => ok(server.address().port)); }),
-    close: () => new Promise((ok) => { store.flush(); server.closeAllConnections?.(); server.close(() => ok()); }),
+    close: () => new Promise((ok) => { clearInterval(heartbeat); clearInterval(sweeper); clearTimeout(changeTimer); for (const r of sse) r.end(); store.flush(); server.closeAllConnections?.(); server.close(() => ok()); }),
   };
+}
+
+const DASHBOARD = fileURLToPath(new URL('./dashboard.html', import.meta.url));
+function dashboardHtml() { // read per request so UI edits show up on reload
+  try { return fs.readFileSync(DASHBOARD, 'utf8'); }
+  catch { return '<!doctype html><title>bus</title><p>Agentic Chat bus is running. Dashboard file missing.</p>'; }
 }
 
 function need(who) {

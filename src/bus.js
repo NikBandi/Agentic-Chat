@@ -28,20 +28,24 @@ export class Bus extends EventEmitter {
   touch(name, team, worktree) {
     name = cleanName(name);
     if (!name || name === HUMAN) return null;
-    if (!NAME_RE.test(name)) throw new BusError(`bad agent name "${name}" (use a-z 0-9 _ -)`);
+    if (!NAME_RE.test(name) || name === 'bus') throw new BusError(`bad agent name "${name}" (use a-z 0-9 _ -; "bus" is reserved)`);
     team = cleanName(team) || (name === LEAD ? LEAD : '');
     if (team && !NAME_RE.test(team)) throw new BusError(`bad team name "${team}"`);
     const now = Date.now();
     let a = this.s.agents[name];
     if (!a) {
       if (!team) throw new BusError(`unknown agent "${name}" — set BUS_TEAM and run: bus join`);
-      a = this.s.agents[name] = { name, team, worktree: worktree || null, joinedAt: now, lastSeen: now, cursor: this.s.seq, task: null };
+      // cursor 0 + joinedSeq: DMs sent before joining (e.g. task offers) are delivered; older mentions are not.
+      a = this.s.agents[name] = { name, team, worktree: worktree || null, joinedAt: now, lastSeen: now, cursor: 0, joinedSeq: this.s.seq, task: null };
       this.#setTeam(name, null, team);
       this.log(`${name} joined team ${team}`);
+      this.store.save();
+      this.emit('join', a);
     } else {
       if (team && team !== a.team) { this.#setTeam(name, a.team, team); this.log(`${name} moved ${a.team} -> ${team}`); a.team = team; }
       if (worktree) a.worktree = worktree;
       a.lastSeen = now;
+      if (a.inactive) { a.inactive = false; this.log(`${name} is active again`); }
     }
     this.store.save();
     return a;
@@ -92,6 +96,23 @@ export class Bus extends EventEmitter {
     }
     const msg = { id: ++this.s.seq, ts: Date.now(), from, channel, to: dm, text, mentions: [...mentions] };
     this.s.messages.push(msg);
+    if (sender?.ifacePending) { // announcing an interface change = mentioning (or posting to) its consuming teams
+      const reached = new Set([...mentions, ...(channel ? [channel.slice(1)] : [])]);
+      for (const [p, teams] of Object.entries(sender.ifacePending)) {
+        const left = teams.filter((t) => !reached.has(t));
+        if (left.length) sender.ifacePending[p] = left;
+        else { delete sender.ifacePending[p]; sender.ifaceNoticed = (sender.ifaceNoticed ?? []).filter((x) => x !== p); }
+      }
+    }
+    this.store.save();
+    this.emit('message', msg);
+    return msg;
+  }
+
+  /** System DM from "bus" (task offers, merges, rejections). Recipient need not have joined yet. */
+  notify(to, text) {
+    const msg = { id: ++this.s.seq, ts: Date.now(), from: 'bus', channel: null, to: cleanName(to), text, mentions: [] };
+    this.s.messages.push(msg);
     this.store.save();
     this.emit('message', msg);
     return msg;
@@ -107,8 +128,10 @@ export class Bus extends EventEmitter {
   #unread(agent) {
     const out = [];
     const ms = this.s.messages;
+    const joined = agent.joinedSeq ?? 0;
     for (let i = ms.length - 1; i >= 0 && ms[i].id > agent.cursor; i--) {
-      if (this.isFor(ms[i], agent)) out.push(ms[i]);
+      const m = ms[i];
+      if ((m.to || m.id > joined) && this.isFor(m, agent)) out.push(m);
     }
     return out.reverse();
   }
@@ -120,6 +143,30 @@ export class Bus extends EventEmitter {
   }
 
   pending(name) { return this.#unread(this.#agent(name)).length; }
+
+  /**
+   * One-line hook notice, or null. Fires once per new batch: if the agent ignores it, later tool
+   * calls stay silent until something newer arrives (so ignored notices don't keep costing tokens).
+   */
+  notice(name) {
+    const a = this.#agent(name);
+    const lines = [];
+    const un = this.#unread(a);
+    const newest = un.at(-1)?.id ?? 0;
+    if (un.length && newest > (a.noticed ?? 0)) {
+      a.noticed = newest;
+      const from = [...new Set(un.map((m) => '@' + m.from))].slice(0, 3).join(', ');
+      lines.push(`bus: ${un.length} new for you (from ${from}) — run: bus read`);
+    }
+    for (const [p, teams] of Object.entries(a.ifacePending ?? {})) {
+      if ((a.ifaceNoticed ??= []).includes(p)) continue;
+      a.ifaceNoticed.push(p);
+      lines.push(`bus: you changed interface ${p} — announce it: bus send ${teams.map((t) => '@' + t).join(' ')} "<what changed>"`);
+    }
+    if (!lines.length) return null;
+    this.store.save();
+    return lines.join('\n');
+  }
 
   /** Unread inbox, capped to the newest INBOX_CAP; advances the read cursor. */
   read(name) {
@@ -157,6 +204,9 @@ export class Bus extends EventEmitter {
       for (const c of this.s.claims) {
         if (c.agent !== a.name && overlaps(p, c.path)) conflicts.push({ path: p, owner: c.agent, claim: c.path });
       }
+      if (a.name !== LEAD) {
+        for (const h of this.s.hotFiles) if (overlaps(p, h)) conflicts.push({ path: p, owner: LEAD, claim: h, hot: true });
+      }
     }
     if (conflicts.length) return { ok: false, conflicts };
     const mine = new Set(this.s.claims.filter((c) => c.agent === a.name).map((c) => c.path));
@@ -186,13 +236,123 @@ export class Bus extends EventEmitter {
     return this.s.claims.filter((c) => !me || c.agent === me);
   }
 
-  /** Is repo-relative `file` free for `name` to edit? */
-  check(name, file) {
+  /**
+   * Is repo-relative `file` free for `name` to edit? Hot files belong to the lead.
+   * With `editing` (the edit-guard hook), an allowed edit to an interface file is recorded so the
+   * agent is reminded to announce it, and can't finish its task until it has.
+   */
+  check(name, file, { editing = false } = {}) {
     const me = cleanName(name);
     const f = normPath(file);
     const other = this.s.claims.find((c) => c.agent !== me && covers(c.path, f));
     if (other) return { free: false, owner: other.agent, claim: other.path };
-    return { free: true, mine: this.s.claims.some((c) => c.agent === me && covers(c.path, f)) };
+    if (me !== LEAD) {
+      const hot = this.s.hotFiles.find((h) => covers(h, f));
+      if (hot) return { free: false, owner: LEAD, claim: hot, hot: true };
+    }
+    const iface = this.s.interfaces.find((i) => covers(i.path, f));
+    const a = this.s.agents[me];
+    if (editing && iface && a && iface.teams.some((t) => t !== a.team)) {
+      (a.ifacePending ??= {})[iface.path] = iface.teams.filter((t) => t !== a.team);
+      this.store.save();
+    }
+    return { free: true, mine: this.s.claims.some((c) => c.agent === me && covers(c.path, f)), ...(iface && { iface: iface.path }) };
+  }
+
+  /** Releasing another agent's claims: the human always, the lead only for inactive agents. */
+  releaseOf(who, target, paths, all = false) {
+    const t = this.#agent(target);
+    if (who !== HUMAN && !(who === LEAD && t.inactive)) throw new BusError('only the human, or the lead for an inactive agent, can release its claims', 403);
+    return this.release(t.name, paths, all);
+  }
+
+  // ---- hot files, change requests, interfaces (DESIGN.md §5) ---------
+
+  #boss(who, what) { if (who !== LEAD && who !== HUMAN) throw new BusError(`only the lead or the human can ${what}`, 403); }
+
+  hotAdd(who, paths) {
+    this.#boss(who, 'manage hot files');
+    const add = [...new Set(paths.map(normPath))].filter((p) => p && !this.s.hotFiles.includes(p));
+    this.s.hotFiles.push(...add);
+    if (add.length) this.log(`hot files added: ${add.join(', ')}`);
+    this.store.save();
+    return this.s.hotFiles;
+  }
+
+  hotRm(who, paths) {
+    this.#boss(who, 'manage hot files');
+    const drop = new Set(paths.map(normPath));
+    this.s.hotFiles = this.s.hotFiles.filter((h) => !drop.has(h));
+    this.store.save();
+    return this.s.hotFiles;
+  }
+
+  /** A worker asks the lead to change a hot file. */
+  request(who, file, text) {
+    const a = this.#agent(who);
+    file = normPath(file);
+    text = String(text ?? '').trim();
+    if (!file || !text) throw new BusError('usage: bus request <file> "change"');
+    this.s.requests ??= [];
+    const r = { id: (this.s.requests.at(-1)?.id ?? 0) + 1, file, agent: a.name, text, status: 'open', reason: '', ts: Date.now() };
+    this.s.requests.push(r);
+    this.log(`${a.name} requested change to ${file}`);
+    this.notify(LEAD, `request r${r.id} from ${a.name} — ${file}: ${text} — bus request done|decline ${r.id} ["why"]`);
+    return r;
+  }
+
+  resolveRequest(who, id, verdict, why = '') {
+    this.#boss(who, 'resolve requests');
+    const r = (this.s.requests ?? []).find((x) => x.id === Number(String(id).replace(/^r/i, '')));
+    if (!r) throw new BusError(`no request ${id}`, 404);
+    if (r.status !== 'open') throw new BusError(`request r${r.id} is already ${r.status}`, 409);
+    if (!['done', 'decline'].includes(verdict)) throw new BusError('verdict must be done or decline');
+    r.status = verdict === 'done' ? 'done' : 'declined';
+    r.reason = String(why || '').trim();
+    this.log(`request r${r.id} ${r.status}`);
+    this.notify(r.agent, `request r${r.id} (${r.file}) ${r.status}${r.reason ? ': ' + r.reason : ''}${r.status === 'done' ? ' — rebase/pull to get it' : ''}`);
+    return r;
+  }
+
+  ifaceAdd(who, path, teams) {
+    this.#boss(who, 'mark interfaces');
+    path = normPath(path);
+    teams = [...new Set(teams.map(cleanName).filter(Boolean))];
+    if (!path || !teams.length) throw new BusError('usage: bus iface add <path> --teams a,b');
+    this.s.interfaces = this.s.interfaces.filter((i) => i.path !== path);
+    this.s.interfaces.push({ path, teams });
+    this.log(`interface ${path} -> ${teams.join(', ')}`);
+    this.store.save();
+    return this.s.interfaces;
+  }
+
+  ifaceRm(who, path) {
+    this.#boss(who, 'mark interfaces');
+    path = normPath(path);
+    this.s.interfaces = this.s.interfaces.filter((i) => i.path !== path);
+    this.store.save();
+    return this.s.interfaces;
+  }
+
+  /** Interface edits not yet announced to all consuming teams. */
+  unannounced(name) { return Object.entries(this.s.agents[cleanName(name)]?.ifacePending ?? {}); }
+
+  // ---- inactivity ------------------------------------------------------
+
+  /** Flag agents silent longer than `ms` (skipping `busy` names, e.g. blocked in bus wait); tell the lead once. */
+  sweep(ms, busy = new Set(), now = Date.now()) {
+    const flagged = [];
+    for (const a of Object.values(this.s.agents)) {
+      if (a.inactive || a.name === LEAD || busy.has(a.name) || now - a.lastSeen < ms) continue;
+      a.inactive = true;
+      flagged.push(a.name);
+      const mins = Math.round((now - a.lastSeen) / 60000);
+      this.log(`${a.name} inactive (${mins}m)`);
+      const fix = a.task ? `bus task reassign ${a.task} <agent>` : `bus release --of ${a.name} --all`;
+      this.notify(LEAD, `${a.name} inactive ${mins}m${a.task ? ' (task #' + a.task + ')' : ''} — ${fix}`);
+    }
+    if (flagged.length) this.store.save();
+    return flagged;
   }
 
   // ---- activity log (dashboard only) ----------------------------------

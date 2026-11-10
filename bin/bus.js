@@ -18,10 +18,21 @@ const HELP = `bus — local agent chat, claims and tasks
   bus show <id>                         full text of a message
   bus log [#chan] [n]                   read a channel (no #chan: your DMs)
   bus claim <paths...> [-m why]         claim files / dirs/ / globs
-  bus release <paths...> | --all
+  bus release <paths...> | --all        [--of agent: human, or lead if agent inactive]
+  bus request <hot-file> "change"       ask the lead to change a hot file
+  bus request done|decline <id> ["why"] (lead)
+  bus hot add|rm <paths...> | list      lead-owned shared files            (lead/human)
+  bus iface add <path> --teams a,b | rm <path> | list                     (lead/human)
   bus claims [--mine]
   bus check <path>                      is a file free for you to edit?
-  bus pending                           count of unread messages`;
+  bus pending                           count of unread messages
+  bus task add "title" --files a,b/ --check "cmd" [--after 3,4] [--for agent|team]
+               [--brief "text" | --brief-file f] [--timeout secs]          (lead)
+  bus task list [--mine] | show <id> | take <id>
+  bus task done <id> ["summary"]        run the done-check -> merge request
+  bus task merged <id>                  (lead) after merging the approved branch
+  bus task reassign <id> <agent> | drop <id>                    (lead/human)
+  bus approve <id> | bus reject <id> "why"                      (human)`;
 
 function fmt(m) {
   let t = m.text.replace(/\s*\n\s*/g, ' ⏎ ');
@@ -105,13 +116,18 @@ const commands = {
     const why = takeFlag(args, '-m', true) || '';
     const r = await request('POST', '/api/claim', { body: { paths: args, why } });
     if (r.ok) return console.log(`claimed ${r.claimed.join(' ')}`);
-    for (const c of r.conflicts) console.log(`blocked: ${c.path} overlaps ${c.claim} held by ${c.owner} — ask: bus send @${c.owner} "..."`);
+    for (const c of r.conflicts) {
+      console.log(c.hot
+        ? `blocked: ${c.path} overlaps hot file ${c.claim} (lead) — ask: bus request ${c.claim} "..."`
+        : `blocked: ${c.path} overlaps ${c.claim} held by ${c.owner} — ask: bus send @${c.owner} "..."`);
+    }
     process.exitCode = 1;
   },
 
   async release(args) {
     const all = takeFlag(args, '--all');
-    const r = await request('POST', '/api/release', { body: { paths: args, all } });
+    const of = takeFlag(args, '--of', true);
+    const r = await request('POST', '/api/release', { body: { paths: args, all, of } });
     console.log(r.released ? `released ${r.paths.join(' ')}` : 'nothing released');
   },
 
@@ -130,6 +146,56 @@ const commands = {
 
   async pending() { console.log((await request('GET', '/api/pending')).pending); },
 
+  async task([sub, ...args]) {
+    const fn = taskCommands[sub];
+    if (!fn) throw new Error(`usage: bus task add|list|show|take|done|merged|reassign|drop — got "${sub ?? ''}"`);
+    await fn(args);
+  },
+
+  async hot([sub, ...paths]) {
+    if (sub === 'list' || !sub) {
+      const { hotFiles } = await request('GET', '/api/state');
+      return console.log(hotFiles.length ? hotFiles.join('\n') : 'no hot files');
+    }
+    if (!['add', 'rm'].includes(sub)) throw new Error('usage: bus hot add|rm <paths...> | bus hot list');
+    const { hotFiles } = await request('POST', '/api/hot', { body: { paths, rm: sub === 'rm' } });
+    console.log(`hot: ${hotFiles.join(' ') || '-'}`);
+  },
+
+  async request(args) {
+    if (['done', 'decline'].includes(args[0])) {
+      const [verdict, id, ...why] = args;
+      const { request: r } = await request('POST', '/api/request/resolve', { body: { id, verdict, why: why.join(' ') } });
+      return console.log(`r${r.id} ${r.status} — ${r.agent} notified`);
+    }
+    const [file, ...text] = args;
+    const { request: r } = await request('POST', '/api/request', { body: { file, text: text.join(' ') } });
+    console.log(`sent request r${r.id} to @lead`);
+  },
+
+  async iface([sub, p, ...rest]) {
+    if (sub === 'list' || !sub) {
+      const { interfaces } = await request('GET', '/api/state');
+      if (!interfaces.length) return console.log('no interfaces');
+      for (const i of interfaces) console.log(`${i.path} -> ${i.teams.join(',')}`);
+      return;
+    }
+    if (!['add', 'rm'].includes(sub)) throw new Error('usage: bus iface add <path> --teams a,b | rm <path> | list');
+    const teams = csv(takeFlag(rest, '--teams', true));
+    await request('POST', '/api/iface', { body: { path: p, teams, rm: sub === 'rm' } });
+    console.log(sub === 'rm' ? `interface ${p} removed` : `interface ${p} -> ${teams.join(',')}`);
+  },
+
+  async approve([id]) {
+    const { task: t } = await request('POST', '/api/approve', { body: { id } });
+    console.log(`approved #${t.id} — @lead will merge it`);
+  },
+
+  async reject([id, ...why]) {
+    const { task: t } = await request('POST', '/api/reject', { body: { id, why: why.join(' ') } });
+    console.log(`rejected #${t.id} — sent back to ${t.owner}`);
+  },
+
   async init(args) {
     const { init } = await import('../src/init.js');
     for (const line of init(args[0] || process.cwd())) console.log(line);
@@ -137,12 +203,83 @@ const commands = {
 
   async hook([sub]) {
     const hooks = await import('../src/hooks.js');
-    const fn = { pre: hooks.preEdit }[sub];
+    const fn = { pre: hooks.preEdit, post: hooks.postTool }[sub];
     if (!fn) throw new Error(`unknown hook "${sub}"`);
     process.exit(await fn());
   },
 
   help() { console.log(HELP); },
+};
+
+const csv = (v) => (v ? String(v).split(',').map((s) => s.trim()).filter(Boolean) : []);
+
+function taskLine(t) {
+  const who = t.owner || (t.assignee ? '→' + t.assignee : '-');
+  const deps = t.after.length ? ` [after ${t.after.map((d) => '#' + d).join(',')}]` : '';
+  return `#${t.id} ${t.status} ${who}: ${t.title}${deps}`;
+}
+
+function taskDetail(t) {
+  return [
+    taskLine(t),
+    `files: ${t.files.join(' ') || '-'}`,
+    `check: ${t.check}`,
+    t.brief && `\n${t.brief}`,
+  ].filter(Boolean).join('\n');
+}
+
+const taskCommands = {
+  async add(args) {
+    const body = {
+      files: csv(takeFlag(args, '--files', true)),
+      check: takeFlag(args, '--check', true),
+      after: csv(takeFlag(args, '--after', true)),
+      assignee: takeFlag(args, '--for', true),
+      brief: takeFlag(args, '--brief', true) || '',
+      timeout: takeFlag(args, '--timeout', true),
+    };
+    const briefFile = takeFlag(args, '--brief-file', true);
+    if (briefFile) body.brief = (await import('node:fs')).readFileSync(briefFile, 'utf8');
+    body.title = args.join(' ');
+    const { task: t } = await request('POST', '/api/task/add', { body });
+    console.log(`added ${taskLine(t)}`);
+  },
+
+  async list(args) {
+    const mine = takeFlag(args, '--mine');
+    const { tasks } = await request('GET', '/api/task/list', { query: { mine: mine ? 1 : '' } });
+    if (!tasks.length) return console.log(mine ? 'no tasks for you' : 'no tasks');
+    for (const t of tasks) console.log(taskLine(t));
+  },
+
+  async show([id]) { console.log(taskDetail((await request('GET', '/api/task/show', { query: { id } })).task)); },
+
+  async take([id]) {
+    const { task: t } = await request('POST', '/api/task/take', { body: { id } });
+    console.log(`took ${taskDetail(t)}`);
+  },
+
+  async done([id, ...summary]) {
+    const r = await request('POST', '/api/task/done', { body: { id, summary: summary.join(' ') }, headers: { 'x-bus-cwd': gitRoot() } });
+    if (r.ok) return console.log(`check passed — #${r.mr.task} sent to @lead for review`);
+    console.log(`check failed (exit ${r.code}) — fix and rerun bus task done ${id}\n${r.output}`);
+    process.exitCode = 1;
+  },
+
+  async merged([id]) {
+    const { task: t } = await request('POST', '/api/task/merged', { body: { id } });
+    console.log(`#${t.id} merged — claims released, dependents notified`);
+  },
+
+  async reassign([id, to]) {
+    const { task: t } = await request('POST', '/api/task/reassign', { body: { id, to } });
+    console.log(`#${t.id} reassigned to ${t.assignee}`);
+  },
+
+  async drop([id]) {
+    const { task: t } = await request('POST', '/api/task/drop', { body: { id } });
+    console.log(`#${t.id} dropped`);
+  },
 };
 
 async function main([cmd = 'help', ...args]) {

@@ -24,6 +24,24 @@ export function findRoot(start) {
   }
 }
 
+/**
+ * PostToolUse on every tool: if something new is waiting, add one line to the agent's context via
+ * hookSpecificOutput.additionalContext (plain stdout isn't shown to Claude for PostToolUse).
+ * Nothing waiting -> no output at all, so zero tokens.
+ */
+export async function postTool() {
+  if (!process.env.BUS_AGENT) return 0;
+  process.stdin.resume(); // drain the hook input; we don't need it
+  process.stdin.on('data', () => {});
+  let r;
+  try { r = await request('GET', '/api/notice', { timeoutMs: 800 }); }
+  catch { return 0; }
+  if (r.notice) {
+    process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PostToolUse', additionalContext: r.notice } }));
+  }
+  return 0;
+}
+
 /** PreToolUse on Edit|Write|MultiEdit|NotebookEdit: block edits to files claimed by another agent. */
 export async function preEdit() {
   if (!process.env.BUS_AGENT) return 0;
@@ -36,9 +54,11 @@ export async function preEdit() {
   const rel = root && toRepoPath(abs, root);
   if (!rel) return 0;
   let r;
-  try { r = await request('GET', '/api/check', { query: { path: rel }, timeoutMs: 1500 }); }
+  try { r = await request('GET', '/api/check', { query: { path: rel, edit: 1 }, timeoutMs: 1500 }); }
   catch { return 0; } // bus down / unknown agent: allow silently
   if (r.free) return 0;
-  process.stderr.write(`bus: ${rel} is claimed by ${r.owner} (${r.claim}). Do not edit it or work around this block. Ask the owner: bus send @${r.owner} "<what you need>"\n`);
+  process.stderr.write(r.hot
+    ? `bus: ${rel} is a hot file owned by lead. Do not edit it or work around this block. Ask for the change: bus request ${rel} "<change>"\n`
+    : `bus: ${rel} is claimed by ${r.owner} (${r.claim}). Do not edit it or work around this block. Ask the owner: bus send @${r.owner} "<what you need>"\n`);
   return 2;
 }

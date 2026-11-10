@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agentic Chat Bus</title>
+<style>
+:root{--bg:#f5f6f8;--panel:#fff;--fg:#1c2128;--mute:#66707c;--line:#d8dde3;--accent:#2563eb;--ok:#15803d;--bad:#b91c1c;--warn:#b45309;--hl:#fff7d6;--code:#eef0f3}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1319;--panel:#171c24;--fg:#d9dee5;--mute:#8691a0;--line:#2a323d;--accent:#5b9dff;--ok:#4ade80;--bad:#f87171;--warn:#fbbf24;--hl:#3a3315;--code:#0d1117}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:13px/1.45 system-ui,Segoe UI,sans-serif}
+header{display:flex;align-items:center;gap:12px;padding:8px 16px;border-bottom:1px solid var(--line);background:var(--panel);position:sticky;top:0;z-index:5}
+header h1{font-size:15px;margin:0}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--bad);display:inline-block;margin-right:5px}
+.dot.on{background:var(--ok)}
+main{display:grid;grid-template-columns:minmax(0,3fr) minmax(0,2fr);gap:12px;padding:12px 16px;align-items:start}
+@media (max-width:1000px){main{grid-template-columns:1fr}}
+.col{display:flex;flex-direction:column;gap:12px;min-width:0}
+section{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:8px 10px;min-width:0}
+section.alert{border-color:var(--warn);border-width:2px}
+h2{font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--mute);margin:0 0 6px}
+h2 .n{background:var(--code);border-radius:9px;padding:0 7px;margin-left:4px}
+.empty{color:var(--mute);font-style:italic}
+button,select,input{font:inherit;color:inherit}
+button{background:var(--code);border:1px solid var(--line);border-radius:4px;padding:2px 9px;cursor:pointer}
+button:hover{border-color:var(--accent)}
+button.ok{background:var(--ok);color:#fff;border-color:var(--ok)}
+button.bad{background:var(--bad);color:#fff;border-color:var(--bad)}
+button.link{background:none;border:0;padding:0;color:var(--accent);text-decoration:underline}
+input,select{background:var(--bg);border:1px solid var(--line);border-radius:4px;padding:3px 6px}
+:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+.card{border:1px solid var(--line);border-radius:5px;padding:6px 8px;margin-bottom:6px}
+.row{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+.mute{color:var(--mute)}
+.tag{font-size:11px;border-radius:3px;padding:0 5px;background:var(--code);border:1px solid var(--line)}
+.pass{color:var(--ok)}.fail{color:var(--bad)}
+pre{background:var(--code);padding:6px;border-radius:4px;overflow:auto;max-height:200px;margin:4px 0;white-space:pre-wrap;word-break:break-word;font:12px/1.4 ui-monospace,Consolas,monospace}
+.cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px}
+.cols h3{font-size:12px;margin:0 0 4px}
+.task{font-size:12px}
+.task .title{font-weight:600}
+table{border-collapse:collapse;width:100%}
+td,th{text-align:left;padding:2px 6px 2px 0;vertical-align:top}
+th{color:var(--mute);font-weight:500}
+.inactive{opacity:.55}
+.chat{display:grid;grid-template-columns:110px minmax(0,1fr);gap:8px}
+.chans{display:flex;flex-direction:column;gap:2px}
+.chans button{text-align:left;border-color:transparent;background:none}
+.chans button[aria-current=true]{background:var(--code);border-color:var(--line);font-weight:600}
+.feed{height:300px;overflow:auto;border:1px solid var(--line);border-radius:4px;padding:4px 6px}
+.msg{padding:1px 4px;border-radius:3px;word-break:break-word;white-space:pre-wrap}
+.msg.hl{background:var(--hl)}
+.msg .who{font-weight:600}
+.msg.bus{color:var(--mute)}
+form.comp{display:flex;gap:6px;margin-top:6px;flex-wrap:wrap}
+form.comp input[name=text]{flex:1;min-width:150px}
+form.comp input[name=to]{width:110px}
+.log{max-height:220px;overflow:auto;font-size:12px}
+.log div{padding:1px 0;border-bottom:1px dotted var(--line)}
+#toast{position:fixed;right:14px;bottom:14px;display:flex;flex-direction:column;gap:6px;z-index:9}
+#toast div{background:var(--bad);color:#fff;padding:6px 10px;border-radius:5px;max-width:360px}
+.sr{position:absolute;left:-9999px}
+</style>
+</head>
+<body>
+<header>
+  <h1>Agentic Chat Bus</h1>
+  <span id="conn" role="status"><span class="dot"></span><span id="connTxt">connecting</span></span>
+  <span class="mute" id="seq"></span>
+</header>
+<main>
+  <div class="col">
+    <section id="mrSec" class="alert" aria-labelledby="mrH"><h2 id="mrH">Merge requests awaiting approval<span class="n" id="mrN">0</span></h2><div id="mr"></div></section>
+    <section aria-labelledby="tbH"><h2 id="tbH">Task board</h2><div id="board" class="cols"></div></section>
+    <section aria-labelledby="msgH"><h2 id="msgH">Messages</h2>
+      <div class="chat"><nav class="chans" id="chans" aria-label="Channels"></nav>
+        <div><div class="feed" id="feed" tabindex="0" aria-live="polite"></div>
+          <form class="comp" id="comp">
+            <label class="sr" for="to">Send to</label><input id="to" name="to" placeholder="#chan or @agent" autocomplete="off">
+            <label class="sr" for="text">Message</label><input id="text" name="text" placeholder="Message (as you)" autocomplete="off">
+            <button class="ok" type="submit">Send</button>
+          </form></div></div>
+    </section>
+  </div>
+  <div class="col">
+    <section aria-labelledby="agH"><h2 id="agH">Agents<span class="n" id="agN">0</span></h2><div id="agents"></div></section>
+    <section aria-labelledby="clH"><h2 id="clH">Claims<span class="n" id="clN">0</span></h2><div id="claims"></div></section>
+    <section aria-labelledby="shH"><h2 id="shH">Hot files · interfaces · requests</h2><div id="shared"></div></section>
+    <section aria-labelledby="acH"><h2 id="acH">Activity</h2><div class="log" id="act"></div></section>
+  </div>
+</main>
+<div id="toast" aria-live="assertive"></div>
+<script>
+'use strict';
+const $ = (id) => document.getElementById(id);
+const INACTIVE_MS = 30 * 60 * 1000;
+const STATUSES = ['open', 'in_progress', 'review', 'approved', 'merged', 'dropped'];
+let S = null;
+let chan = '#general';
+const expanded = new Set(), showOut = new Set(), rejecting = new Set(), reassigning = new Set();
+
+function h(tag, attrs, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v == null || v === false) continue;
+    if (k === 'class') e.className = v;
+    else if (k.startsWith('on')) e.addEventListener(k.slice(2), v);
+    else e.setAttribute(k, v === true ? '' : v);
+  }
+  for (const k of kids.flat()) if (k != null && k !== false) e.append(k);   // strings become text nodes
+  return e;
+}
+function ago(ts) {
+  if (!ts) return 'never';
+  const s = Math.max(0, (Date.now() - ts) / 1000);
+  if (s < 60) return Math.floor(s) + 's ago';
+  if (s < 3600) return Math.floor(s / 60) + 'm ago';
+  if (s < 86400) return Math.floor(s / 3600) + 'h ago';
+  return Math.floor(s / 86400) + 'd ago';
+}
+const clock = (ts) => new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+
+function toast(msg) {
+  const d = h('div', {}, String(msg));
+  $('toast').append(d);
+  setTimeout(() => d.remove(), 6000);
+}
+async function api(path, body) {
+  try {
+    const r = await fetch(path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.error || r.status + ' ' + r.statusText);
+    refresh();
+    return j;
+  } catch (e) { toast(e.message); return null; }
+}
+
+// ---- live updates: SSE -> coalesced single-flight fetch ----
+let inflight = false, again = false;
+async function refresh() {
+  if (inflight) { again = true; return; }
+  inflight = true;
+  try {
+    const r = await fetch('/api/state');
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || 'state ' + r.status);
+    S = await r.json();
+    render();
+  } catch (e) { toast('Refresh failed: ' + e.message); }
+  inflight = false;
+  if (again) { again = false; refresh(); }
+}
+let timer = 0;
+function schedule() { clearTimeout(timer); timer = setTimeout(refresh, 80); }
+function connect() {
+  const es = new EventSource('/api/events');
+  es.addEventListener('change', schedule);
+  es.onopen = () => { setConn(true); refresh(); };
+  es.onerror = () => setConn(false);
+}
+function setConn(on) {
+  document.querySelector('#conn .dot').className = 'dot' + (on ? ' on' : '');
+  $('connTxt').textContent = on ? 'connected' : 'disconnected - retrying';
+}
+
+// ---- render ----
+function render() {
+  $('seq').textContent = 'seq ' + S.seq;
+  renderMR(); renderBoard(); renderAgents(); renderClaims(); renderShared(); renderChat(); renderAct();
+}
+function renderShared() {
+  const hot = S.hotFiles || [], ifs = S.interfaces || [], reqs = (S.requests || []).filter((r) => r.status === 'open');
+  const rows = [
+    ...hot.map((p) => h('tr', {}, h('td', {}, 'hot'), h('td', {}, h('code', {}, p)), h('td', { class: 'mute' }, 'owned by lead'))),
+    ...ifs.map((i) => h('tr', {}, h('td', {}, 'interface'), h('td', {}, h('code', {}, i.path)), h('td', { class: 'mute' }, 'used by ' + i.teams.join(', ')))),
+    ...reqs.map((r) => h('tr', {}, h('td', {}, 'request r' + r.id), h('td', {}, h('code', {}, r.file)), h('td', {}, r.agent + ': ' + r.text))),
+  ];
+  $('shared').replaceChildren(rows.length
+    ? h('table', {}, h('tr', {}, ['Kind', 'Path', 'Detail'].map((x) => h('th', {}, x))), rows)
+    : h('div', { class: 'empty' }, 'No hot files, interfaces or open requests'));
+}
+function checkBadge(t) {
+  const r = t.result;
+  if (!r) return h('span', { class: 'mute' }, 'no check run');
+  return h('button', { class: 'link ' + (r.ok ? 'pass' : 'fail'), 'aria-expanded': showOut.has(t.id), onclick: () => { toggle(showOut, t.id); render(); } },
+    (r.ok ? 'check passed' : 'check FAILED (exit ' + r.code + ')') + (r.ms != null ? ' ' + r.ms + 'ms' : ''));
+}
+function toggle(set, k) { set.has(k) ? set.delete(k) : set.add(k); }
+function outPre(t) { return showOut.has(t.id) && t.result ? h('pre', {}, t.result.output || '(no output)') : null; }
+
+function renderMR() {
+  const rev = S.tasks.filter((t) => t.status === 'review');
+  $('mrN').textContent = rev.length;
+  $('mrSec').style.display = rev.length ? '' : 'none';
+  $('mr').replaceChildren(...rev.map((t) => {
+    const mr = S.mergeRequests.find((m) => m.task === t.id && m.status === 'pending') || S.mergeRequests.find((m) => m.task === t.id) || {};
+    const rej = rejecting.has(t.id);
+    let why;
+    return h('div', { class: 'card' },
+      h('div', { class: 'row' }, h('strong', {}, '#' + t.id + ' ' + t.title), h('span', { class: 'tag' }, mr.agent || t.owner || '?'),
+        h('span', { class: 'tag' }, mr.branch || t.branch || 'no branch'), h('span', { class: 'mute' }, ago(mr.ts || t.updatedAt))),
+      (mr.summary || t.summary) ? h('div', {}, mr.summary || t.summary) : null,
+      h('div', {}, checkBadge(t)), outPre(t),
+      rej ? h('form', { class: 'row', onsubmit: (e) => { e.preventDefault(); rejecting.delete(t.id); api('/api/reject', { id: t.id, why: why.value }); } },
+          h('label', { class: 'sr', for: 'why' + t.id }, 'Reject reason'),
+          why = h('input', { id: 'why' + t.id, placeholder: 'Reason for rejecting', required: true, size: 36 }),
+          h('button', { class: 'bad', type: 'submit' }, 'Confirm reject'),
+          h('button', { type: 'button', onclick: () => { rejecting.delete(t.id); render(); } }, 'Cancel'))
+        : h('div', { class: 'row' },
+          h('button', { class: 'ok', onclick: () => api('/api/approve', { id: t.id }) }, 'Approve'),
+          h('button', { class: 'bad', onclick: () => { rejecting.add(t.id); render(); setTimeout(() => $('why' + t.id)?.focus()); } }, 'Reject')));
+  }));
+  if (!rev.length) $('mr').replaceChildren(h('div', { class: 'empty' }, 'Nothing awaiting approval'));
+}
+
+function taskCard(t) {
+  const open = expanded.has(t.id);
+  const deps = (t.after || []).map((d) => '#' + d).join(' ');
+  const live = t.status !== 'merged' && t.status !== 'dropped';
+  const names = Object.keys(S.agents);
+  let sel;
+  return h('div', { class: 'card task' },
+    h('button', { class: 'link title', 'aria-expanded': open, onclick: () => { toggle(expanded, t.id); render(); } }, '#' + t.id + ' ' + t.title),
+    h('div', { class: 'mute' }, (t.owner || t.assignee || 'unassigned') + (deps ? ' | after ' + deps : '') + ' | ' + ago(t.updatedAt)),
+    t.result ? h('div', {}, checkBadge(t)) : null, outPre(t),
+    open ? h('div', {}, t.brief ? h('div', { class: 'msg' }, t.brief) : null,
+      t.files?.length ? h('div', { class: 'mute' }, 'files: ' + t.files.join(', ')) : null,
+      t.check ? h('div', { class: 'mute' }, 'check: ' + t.check) : null,
+      t.branch ? h('div', { class: 'mute' }, 'branch: ' + t.branch) : null,
+      t.summary ? h('div', {}, t.summary) : null) : null,
+    live ? (reassigning.has(t.id)
+      ? h('form', { class: 'row', onsubmit: (e) => { e.preventDefault(); reassigning.delete(t.id); api('/api/task/reassign', { id: t.id, to: sel.value }); } },
+          h('label', { class: 'sr', for: 'ra' + t.id }, 'Reassign to'),
+          sel = h('select', { id: 'ra' + t.id }, names.map((n) => h('option', { value: n }, n))),
+          h('button', { type: 'submit' }, 'Go'), h('button', { type: 'button', onclick: () => { reassigning.delete(t.id); render(); } }, 'Cancel'))
+      : h('div', { class: 'row' },
+          h('button', { onclick: () => { reassigning.add(t.id); render(); } }, 'Reassign'),
+          h('button', { onclick: () => { if (confirm('Drop task #' + t.id + '?')) api('/api/task/drop', { id: t.id }); } }, 'Drop'))) : null);
+}
+function renderBoard() {
+  $('board').replaceChildren(...STATUSES.map((st) => {
+    const ts = S.tasks.filter((t) => t.status === st);
+    return h('div', {}, h('h3', {}, st.replace('_', ' ') + ' (' + ts.length + ')'), ts.map(taskCard));
+  }));
+}
+
+function isActive(a) { return Date.now() - a.lastSeen < INACTIVE_MS; }
+function renderAgents() {
+  const as = Object.values(S.agents).sort((a, b) => isActive(b) - isActive(a) || a.name.localeCompare(b.name));
+  $('agN').textContent = as.length;
+  $('agents').replaceChildren(as.length ? h('table', {}, h('tr', {}, ['Agent', 'Team', 'Task', 'Seen'].map((x) => h('th', {}, x))),
+    as.map((a) => {
+      const t = a.task != null && S.tasks.find((x) => x.id === a.task);
+      return h('tr', { class: isActive(a) ? '' : 'inactive' },
+        h('td', {}, h('span', { class: 'dot' + (isActive(a) ? ' on' : '') }), a.name), h('td', {}, a.team || '-'),
+        h('td', {}, t ? '#' + t.id + ' ' + t.title : '-'), h('td', { class: 'mute' }, (isActive(a) ? '' : 'inactive, ') + 'seen ' + ago(a.lastSeen)));
+    })) : h('div', { class: 'empty' }, 'No agents joined'));
+}
+function renderClaims() {
+  $('clN').textContent = S.claims.length;
+  $('claims').replaceChildren(S.claims.length ? h('table', {}, h('tr', {}, ['Path', 'Agent', 'Why'].map((x) => h('th', {}, x))),
+    S.claims.map((c) => h('tr', {}, h('td', {}, h('code', {}, c.path)), h('td', {}, c.agent), h('td', { class: 'mute' }, c.why || ''))))
+    : h('div', { class: 'empty' }, 'No active claims'));
+}
+
+function channels() {
+  const set = new Set(['#general']);
+  for (const t of Object.keys(S.teams || {})) set.add('#' + t);
+  for (const m of S.messages) if (m.channel) set.add(m.channel);
+  return [...set];
+}
+const mentionsMe = (m) => m.to === 'you' || (m.mentions || []).some((x) => x === 'you' || x === '@you') || /(^|\s)@you\b/.test(m.text);
+function renderChat() {
+  const list = channels().concat('DMs');
+  const unhl = (c) => S.messages.some((m) => mentionsMe(m) && (c === 'DMs' ? m.to : m.channel === c) && m.from !== 'you');
+  if (!list.includes(chan)) chan = '#general';
+  $('chans').replaceChildren(...list.map((c) => h('button', { 'aria-current': c === chan, onclick: () => { chan = c; $('to').value = c === 'DMs' ? '@' : c; renderChat(); } }, c + (unhl(c) && c !== chan ? ' *' : ''))));
+  const feed = $('feed'), stick = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 40;
+  const ms = S.messages.filter((m) => chan === 'DMs' ? m.to : m.channel === chan);
+  feed.replaceChildren(...(ms.length ? ms.map((m) => h('div', { class: 'msg' + (mentionsMe(m) && m.from !== 'you' ? ' hl' : '') + (m.from === 'bus' ? ' bus' : '') },
+    h('span', { class: 'mute' }, clock(m.ts) + ' '), h('span', { class: 'who' }, m.from + (m.to ? ' > ' + m.to : '')), ': ', m.text)) : [h('div', { class: 'empty' }, 'No messages')]));
+  if (stick) feed.scrollTop = feed.scrollHeight;
+  if (!$('to').dataset.init) { $('to').value = chan; $('to').dataset.init = 1; }
+}
+function renderAct() {
+  $('act').replaceChildren(...[...S.activity].sort((a, b) => b.ts - a.ts).slice(0, 100).map((a) => h('div', {}, h('span', { class: 'mute' }, clock(a.ts) + ' '), a.text)));
+}
+
+$('comp').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const text = $('text').value.trim();
+  if (!text) return;
+  let to = $('to').value.trim();
+  if (to === 'DMs') to = '';
+  const r = await api('/api/send', { to, text });
+  if (r) $('text').value = '';
+});
+setInterval(() => { if (S) { renderAgents(); } }, 30000);   // keep relative times fresh
+connect();
+refresh();
+</script>
+</body>
+</html>

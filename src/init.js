@@ -23,6 +23,7 @@ const hookCmd = (sub) => `node "${BUS_BIN.replace(/\\/g, '/')}" hook ${sub}`;
 
 export const HOOKS = {
   PreToolUse: { matcher: 'Edit|Write|MultiEdit|NotebookEdit', sub: 'pre' },
+  PostToolUse: { matcher: '*', sub: 'post' },
 };
 
 /** Add (or update) our hook entries in a settings object. Returns true if it changed. */

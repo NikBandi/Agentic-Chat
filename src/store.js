@@ -29,6 +29,7 @@ export class Store {
   }
 
   save() {
+    this.onChange?.();
     if (!this.file || this.timer) return;
     this.timer = setTimeout(() => this.flush(), this.delay);
   }
