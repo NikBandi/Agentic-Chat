@@ -1,0 +1,176 @@
+# Agentic Chat — Design
+
+A local coordination layer that lets many Claude Code agents work on one codebase at the same time without overwriting each other's code. Agents talk through team channels and @mentions, own files through claims, and hand finished work to a lead agent who merges it after the human approves.
+
+**Top priority: minimal token usage.** Every feature below is shaped so agents only ever read what they actually need. When in doubt, choose the option that costs agents fewer tokens.
+
+---
+
+## 1. Roles
+
+| Role | Who | Responsibilities |
+|---|---|---|
+| **Human** | You | Opens each Claude Code session manually. Gives the lead the goal. Approves or rejects merges. Watches the dashboard and can post anywhere. |
+| **Lead agent** | One Claude Code session | Splits the goal into tasks, assigns them, writes each task's done-check, owns the hot files, reviews and merges finished work after human approval, handles escalations and inactive agents. The only agent with the big picture. |
+| **Worker agents** | Many Claude Code sessions | Each runs in its **own git worktree**, belongs to **one team**, works **one task at a time**. |
+
+Agents are **not** launched automatically. The human starts every session (in Orca's terminal) with a name and team.
+
+---
+
+## 2. Workflow
+
+1. **Human → lead:** the human starts the lead session and describes what they need.
+2. **Lead plans:** the lead creates tasks on the board. Each task has:
+   - title and a self-contained brief (goal, constraints, interfaces it must match) — written so the worker never needs chat history
+   - **files** it owns (files, directories ending in `/`, or globs)
+   - **done-check**: a shell command that must pass (e.g. `npm test -- users`)
+   - **dependencies** on other tasks (optional)
+   - **assignee**: a specific agent or a team
+3. **Workers start:** the human opens worker sessions, each with a name + team (e.g. `frontend-1` / `frontend`). On startup a worker registers and picks up the task assigned to it; a team-assigned task goes to the first free member of that team. A task whose dependencies aren't merged yet can't be taken.
+4. **Claim on take:** taking a task claims its files. Edits to files claimed by anyone else are blocked (see §5).
+5. **Done-check:** the worker runs `bus task done <id>`. The bus runs the task's done-check **in that worker's worktree**. If it fails, the task stays in progress and the worker sees the failure output (truncated). The lead does **not** re-run the check after merging.
+6. **Merge request:** a passing task becomes a merge request. The lead reviews it and asks the human to approve.
+7. **Human approval — two ways, both supported:**
+   - **Approve / Reject** buttons on the dashboard
+   - replying in chat (e.g. `@lead approve #4` / `@lead reject #4 reason`)
+8. **Merge:** after approval the lead merges the task branch. Then automatically:
+   - the task's claims are released
+   - owners of tasks that depended on it are mentioned: `#4 merged — rebase and start #7`
+
+---
+
+## 3. Communication
+
+### Channels and mentions
+- One channel per team: `#frontend`, `#backend`, … plus `#general`.
+- Mentions: `@agent-name`, `@team-name` (everyone on that team), `@lead`, `@you` (the human).
+- Workers may DM each other directly — they don't route through the lead (relaying would cost the lead tokens).
+
+### What an agent receives (mention-only by default)
+An agent's inbox contains **only**:
+- DMs to it
+- messages mentioning `@its-name` or `@its-team`
+- updates about its own task (merge, rejection, dependency ready, reassignment)
+
+It does **not** read whole channels unless it explicitly asks (`bus log #frontend`).
+
+### Activity log (dashboard only)
+Claims, releases, task status changes, and inactivity notices go to an **activity log** that only the dashboard shows. Agents never read it.
+
+---
+
+## 4. Token-minimization rules
+
+These are requirements, not nice-to-haves.
+
+1. **No polling.** Agents never loop on "check messages".
+   - A Claude Code hook (PostToolUse) adds a **one-line notice** to the agent's context **only when something is waiting** (e.g. `bus: 1 new mention from @backend-2 — run bus read`). When nothing is waiting it outputs nothing → zero tokens. *(Verify the exact hook output format against current Claude Code docs before implementing.)*
+   - When blocked, an agent runs `bus wait`, which blocks at zero token cost until a message for it arrives.
+2. **Self-contained task briefs** so workers don't read history.
+3. **Automatic handoffs** for dependencies — nobody asks "is it ready yet?".
+4. **Compact CLI output:** one line per message, no decoration. Long messages truncated with `bus show <id>` for the full text. Catch-up after a long gap is capped (e.g. last 30, with a "N older skipped" note).
+5. **Routine events stay out of agent inboxes** (activity log only).
+6. **Tiny agent instructions:** the rules injected into each agent's CLAUDE.md stay around 10 lines.
+7. **Done-check output is truncated** to the last relevant lines on failure.
+
+---
+
+## 5. Files, claims, and worktrees
+
+- **Worktrees:** every worker has its own git worktree/branch, so agents physically can't overwrite each other's files.
+- **Claims** prevent two branches from changing the same file, so merges stay clean.
+- Claim paths are **repo-relative with forward slashes** (`src/api/users.ts`), so they mean the same thing in every worktree. Case-insensitive on Windows.
+- A claim can be a file, a directory (`src/api/` covers everything inside), or a glob (`src/**/*.css`).
+- **Enforcement:** a Claude Code **PreToolUse** hook on `Edit|Write|MultiEdit|NotebookEdit` asks the bus whether the file is free for this agent.
+  - Claimed by someone else → block (exit code 2) with a short message telling the agent who owns it and how to ask them.
+  - Free → allow. (Optionally auto-claim on first edit.)
+  - Bus not running or `BUS_AGENT` unset → allow silently (never get in the way).
+- **Known gap:** the hook only sees Claude Code's edit tools. Writes via shell commands aren't caught; agent instructions forbid working around a block.
+
+### Hot files — one owner
+Shared files everyone needs (`package.json`, lockfiles, shared types, global config, route registries) are **owned by the lead**. Workers request changes instead of editing:
+
+```
+bus request package.json "add zod ^3"
+```
+
+The lead applies or declines the request.
+
+### Interface changes
+- Shared interfaces (API contracts, shared types, DB schema) are claimed by one owner.
+- Files can be marked as **interfaces**, with a list of consuming teams.
+- When an owner edits an interface file, the bus reminds them (via the hook notice) to `@mention` the consuming teams describing the change. Announcing is required.
+
+### Claim lifetime and inactive agents
+- Claims are released when the task is **merged** (or dropped/reassigned).
+- **No automatic expiry.** Instead:
+  - An agent silent for **30 minutes** (configurable) is marked **inactive** on the dashboard and the lead is notified.
+  - Only the **human or the lead** can release an inactive agent's claims or reassign its task: `bus task reassign <id> <agent>`.
+- Any bus command or hook call from an agent counts as activity.
+
+---
+
+## 6. Dashboard
+
+Local web page served by the bus:
+- agents (name, team, task, active/inactive)
+- task board (status, owner, dependencies, done-check result)
+- claims
+- team channels + DMs feed, with a composer so the human can post anywhere
+- **merge requests with Approve / Reject buttons**
+- activity log
+- live updates (Server-Sent Events)
+
+---
+
+## 7. Proposed CLI surface (`bus`)
+
+Agent identity comes from env vars set when the human starts the session: `BUS_AGENT` (name) and `BUS_TEAM` (team).
+
+```
+bus serve                               start the server + dashboard
+bus init [project]                      add hooks + agent instructions to a project
+
+bus join                                register (name/team from env)
+bus who                                 list agents
+bus send [#channel|@agent|@team] text   post
+bus read                                my inbox (mention-only)
+bus wait [secs]                         block until something arrives for me
+bus show <msg-id>                       full text of a truncated message
+bus log [#channel] [n]                  explicitly read a channel
+
+bus claim <paths...> [-m why]
+bus release <paths...> | --all
+bus claims [--mine]
+bus request <hot-file> "change"         ask the lead to change a hot file
+
+bus task add "title" --files a,b/ --check "cmd" [--after 3,4] [--for agent|team]   (lead)
+bus task list [--mine]
+bus task take <id>
+bus task done <id> ["summary"]          runs the done-check → merge request
+bus task reassign <id> <agent>          (lead/human)
+bus approve <id> | bus reject <id> "why" (human, also via dashboard)
+```
+
+---
+
+## 8. Implementation notes
+
+- **Node.js, zero dependencies** (Node 18+ for built-in `fetch`). Single local HTTP server, JSON file persistence, SSE for the dashboard, long-polling for `bus wait`.
+- Binds to `127.0.0.1` only.
+- Persistence shape (epoch-ms timestamps):
+  `{ messages[], agents{}, teams{}, claims[], tasks[], mergeRequests[], hotFiles[], interfaces[] }`
+- `bus init` merges into an existing `.claude/settings.json` without clobbering other settings and appends the agent instructions to the project's CLAUDE.md between `<!-- agent-bus -->` markers.
+
+### Orca overlap — check first
+The project will be developed and run inside the Orca IDE, which already manages worktrees and has its own agent messaging/task handoff. Before building, check what Orca provides and **reuse it rather than rebuild it** (especially worktree creation). The parts that are unique to this project: file claims with edit blocking, mention-only inboxes, done-checks, merge approval, hot-file ownership, and interface alerts.
+
+### Suggested build order
+1. Server core: agents/teams, messages with mention-only inbox, claims, persistence
+2. `bus` CLI for the above
+3. PreToolUse edit-guard hook + `bus init`
+4. Tasks: dependencies, done-checks, merge requests, approvals, auto-handoff
+5. PostToolUse notification hook (zero output when nothing is waiting)
+6. Dashboard
+7. Hot files, interface alerts, inactivity handling
