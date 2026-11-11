@@ -86,7 +86,9 @@ These are requirements, not nice-to-haves.
   - Claimed by someone else → block (exit code 2) with a short message telling the agent who owns it and how to ask them.
   - Free → allow. (Optionally auto-claim on first edit.)
   - Bus not running or `BUS_AGENT` unset → allow silently (never get in the way).
-- **Known gap:** the hook only sees Claude Code's edit tools. Writes via shell commands aren't caught; agent instructions forbid working around a block.
+- **Shell writes:** the hook above only sees Claude Code's edit tools. A **git pre-commit hook**, installed by `bus init`, closes the gap at commit time. It checks every staged file and blocks the commit if a file is claimed by another agent, or is a hot file and the committer isn't the lead. It allows the commit when `BUS_AGENT` is unset, when the bus is down, or when concluding a merge. Any existing hook is kept as `pre-commit.pre-bus` and run first. Shell writes can still change the working tree, but they can't be committed.
+- **Bus down is visible:** when a hook can't reach the bus while `BUS_AGENT` is set, it allows the action and prints `bus: server unreachable — edits are NOT being guarded` once. A marker in the temp dir, keyed on agent and port, keeps it to once and is cleared when the bus answers again.
+- **Optional identity proof (`BUS_AUTH=1`, off by default):** `bus join` issues a per-agent token, stored in `<worktree>/.bus/agents/<name>.token` (git-ignored). The server stores only its hash and requires the token on every later request from that agent. `bus auth reset <agent>` (human) recovers a lost one. The human is still the identity-less caller.
 
 ### Hot files — one owner
 Shared files everyone needs (`package.json`, lockfiles, shared types, global config, route registries) are **owned by the lead**. Workers request changes instead of editing:
@@ -152,6 +154,7 @@ bus task done <id> ["summary"] [--allow-dirty]   needs committed work; runs the 
 bus task merged <id> [--force]          (lead) verifies the commit is in main, then releases claims
 bus task reassign <id> <agent>          (lead/human)
 bus approve <id> | bus reject <id> "why" (human, also via dashboard)
+bus auth reset <agent>                  (human) drop an agent's token when BUS_AUTH=1
 ```
 
 ---

@@ -2,6 +2,7 @@
 // no x-bus-agent means the human ("you").
 import http from 'node:http';
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { Bus, BusError, HUMAN, cleanName } from './bus.js';
 import { Store } from './store.js';
@@ -15,10 +16,33 @@ export function createServer({
   dataFile = null, port = DEFAULT_PORT, host = '127.0.0.1',
   inactiveMs = (Number(process.env.BUS_INACTIVE_MIN) || 30) * 60_000,
   repoDir = process.cwd(), // merges are verified here when the lead's worktree is unknown
+  auth = process.env.BUS_AUTH === '1', // per-agent tokens (off by default)
 } = {}) {
   const store = new Store(dataFile);
   const bus = new Bus(store);
   const tasks = new Tasks(bus, { repo: repoDir });
+  bus.s.tokens ??= {}; // agent -> sha256(token); never served
+
+  /** BUS_AUTH: an agent with a token must present it; an agent without one may only join (and gets one). */
+  function authenticate(who, req, isJoin) {
+    if (!auth || who === HUMAN) return;
+    const want = bus.s.tokens[who];
+    if (!want) {
+      if (isJoin) return;
+      throw new BusError(`auth on — run bus join from your worktree first`, 401);
+    }
+    const got = crypto.createHash('sha256').update(hdr(req, 'x-bus-token')).digest('hex');
+    if (!crypto.timingSafeEqual(Buffer.from(got), Buffer.from(want))) {
+      throw new BusError(`bad or missing token for ${who} — run bus from the worktree that joined, or ask the human: bus auth reset ${who}`, 401);
+    }
+  }
+  function issueToken(who) {
+    if (!auth || who === HUMAN || bus.s.tokens[who]) return undefined;
+    const token = crypto.randomBytes(24).toString('base64url');
+    bus.s.tokens[who] = crypto.createHash('sha256').update(token).digest('hex');
+    store.save();
+    return token;
+  }
   const waiters = new Map(); // agent -> Set<fn>
 
   // Dashboard live updates (SSE). Any state change -> one debounced "change" event; clients refetch /api/state.
@@ -45,7 +69,16 @@ export function createServer({
   });
 
   const routes = {
-    'POST /api/join': ({ me }) => ({ agent: me }),
+    'POST /api/join': ({ who, me }) => ({ agent: me, token: issueToken(who) }),
+    'POST /api/auth/reset': ({ who, body }) => {
+      if (who !== HUMAN) throw new BusError('only the human can reset a token', 403);
+      const name = cleanName(body.agent);
+      const had = !!bus.s.tokens[name];
+      delete bus.s.tokens[name];
+      bus.log(`token reset for ${name}`);
+      store.save();
+      return { agent: name, reset: had };
+    },
     'GET /api/who': () => ({ agents: bus.who() }),
     'POST /api/send': ({ who, body }) => ({ message: bus.send(who, body.to, body.text) }),
     'POST /api/read': ({ who }) => bus.read(need(who)),
@@ -63,7 +96,7 @@ export function createServer({
     'POST /api/request': ({ who, body }) => ({ request: bus.request(need(who), body.file, body.text) }),
     'POST /api/request/resolve': ({ who, body }) => ({ request: bus.resolveRequest(who, body.id, body.verdict, body.why) }),
     'POST /api/iface': ({ who, body }) => ({ interfaces: body.rm ? bus.ifaceRm(who, body.path) : bus.ifaceAdd(who, body.path, arr(body.teams)) }),
-    'GET /api/state': () => bus.s,
+    'GET /api/state': () => ({ ...bus.s, tokens: undefined }),
     'POST /api/wait': waitRoute,
     'POST /api/task/add': ({ who, body }) => ({ task: tasks.add(who, { ...body, files: arr(body.files), after: arr(body.after) }) }),
     'GET /api/task/list': ({ who, q }) => ({ tasks: tasks.list(who, !!q.get('mine')) }),
@@ -113,6 +146,7 @@ export function createServer({
         throw new BusError(`no route ${req.method} ${url.pathname}`, 404);
       }
       const who = cleanName(hdr(req, 'x-bus-agent')) || HUMAN;
+      authenticate(who, req, url.pathname === '/api/join'); // before touch(): unproven agents aren't registered
       const me = who === HUMAN ? null : bus.touch(who, hdr(req, 'x-bus-team'), hdr(req, 'x-bus-cwd'));
       const body = req.method === 'POST' ? await readBody(req) : {};
       const out = await route({ who, me, body, q: url.searchParams, req, res });

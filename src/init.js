@@ -3,6 +3,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { execFileSync } from 'node:child_process';
 
 const BUS_BIN = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'bin', 'bus.js');
 const START = '<!-- agent-bus -->';
@@ -48,6 +49,49 @@ export function mergeSettings(settings) {
   return changed;
 }
 
+export const GIT_HOOK_MARK = '# agent-bus pre-commit';
+export const CHAINED = 'pre-commit.pre-bus';
+
+/** Shell script for .git/hooks/pre-commit: run any hook it replaced, then the bus claim guard. */
+export const gitHookScript = () => `#!/bin/sh
+${GIT_HOOK_MARK} — installed by \`bus init\`. Blocks commits of files claimed by another agent.
+# A pre-commit hook that was here before is kept as ${CHAINED} and runs first.
+hook_dir=$(dirname "$0")
+if [ -x "$hook_dir/${CHAINED}" ]; then "$hook_dir/${CHAINED}" "$@" || exit $?; fi
+[ -z "$BUS_AGENT" ] && exit 0
+exec node "${BUS_BIN.replace(/\\/g, '/')}" hook commit
+`;
+
+/**
+ * Install the git pre-commit hook into the repo's hooks dir (honours core.hooksPath and worktrees' common dir).
+ * Never overwrites a foreign hook: it is renamed to pre-commit.pre-bus and chained. Returns a status line.
+ */
+export function installGitHook(dir) {
+  let hooks;
+  try {
+    hooks = execFileSync('git', ['rev-parse', '--git-path', 'hooks'], { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+  } catch { return `not a git repo — skipped pre-commit hook in ${dir}`; }
+  hooks = path.resolve(dir, hooks);
+  fs.mkdirSync(hooks, { recursive: true });
+  const file = path.join(hooks, 'pre-commit');
+  const script = gitHookScript();
+  if (fs.existsSync(file)) {
+    const cur = fs.readFileSync(file, 'utf8');
+    if (cur.includes(GIT_HOOK_MARK)) {
+      if (cur === script) return `pre-commit hook already current in ${hooks}`;
+      fs.writeFileSync(file, script, { mode: 0o755 });
+      return `updated pre-commit hook in ${hooks}`;
+    }
+    const chained = path.join(hooks, CHAINED);
+    if (fs.existsSync(chained)) return `left existing pre-commit hook alone (${CHAINED} already exists) in ${hooks}`;
+    fs.renameSync(file, chained);
+    fs.writeFileSync(file, script, { mode: 0o755 });
+    return `installed pre-commit hook in ${hooks} (chains to your previous hook, now ${CHAINED})`;
+  }
+  fs.writeFileSync(file, script, { mode: 0o755 });
+  return `installed pre-commit hook in ${hooks}`;
+}
+
 /** Insert or replace the marked agent-rules block. */
 export function mergeClaudeMd(text) {
   const s = text.indexOf(START), e = text.indexOf(END);
@@ -76,5 +120,6 @@ export function init(projectDir = process.cwd()) {
   const after = mergeClaudeMd(before);
   if (after !== before) { fs.writeFileSync(mdFile, after); out.push(`updated ${mdFile}`); }
   else out.push(`agent rules already current in ${mdFile}`);
+  out.push(installGitHook(dir));
   return out;
 }

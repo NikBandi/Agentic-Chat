@@ -84,12 +84,11 @@ describe('PreToolUse edit guard', () => {
     const nb = { cwd: repo, tool_name: 'NotebookEdit', tool_input: { notebook_path: path.join(repo, 'src', 'api', 'n.ipynb') } };
     assert.equal((await run({ BUS_AGENT: 'bob', BUS_TEAM: 'be' }, nb)).status, 2);
   });
-  test('allows owner, free files, no identity, and a down server — silently', async () => {
+  test('allows owner, free files and no identity — silently (bus-down warning: test/guard.test.js)', async () => {
     for (const r of await Promise.all([
       run({ BUS_AGENT: 'alice', BUS_TEAM: 'fe' }, edit(path.join(repo, 'src', 'api', 'u.ts'))),
       run({ BUS_AGENT: 'bob', BUS_TEAM: 'be' }, edit(path.join(repo, 'README.md'))),
       run({}, edit(path.join(repo, 'src', 'api', 'u.ts'))),
-      run({ BUS_AGENT: 'bob', BUS_TEAM: 'be', BUS_URL: 'http://127.0.0.1:1' }, edit(path.join(repo, 'src', 'api', 'u.ts'))),
     ])) { assert.equal(r.status, 0); assert.equal(r.stdout + r.stderr, ''); }
   });
 
@@ -97,10 +96,10 @@ describe('PreToolUse edit guard', () => {
     const post = (env) => run(env, { tool_name: 'Bash', tool_input: { command: 'ls' } }, 'post');
     const carol = { BUS_AGENT: 'carol', BUS_TEAM: 'qa' };
 
-    test('silent when nothing is waiting, without identity, or with the server down', async () => {
+    test('silent when nothing is waiting or without identity', async () => {
       srv.bus.touch('carol', 'qa');
       srv.bus.read('carol');
-      for (const r of await Promise.all([post(carol), post({}), post({ ...carol, BUS_URL: 'http://127.0.0.1:1' })])) {
+      for (const r of await Promise.all([post(carol), post({})])) {
         assert.equal(r.status, 0);
         assert.equal(r.stdout + r.stderr, '');
       }

@@ -2,7 +2,7 @@
 // `bus` CLI. Output is deliberately terse: one line per item, no decoration (agents pay for every token).
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { request } from '../src/client.js';
+import { request, tokenFile } from '../src/client.js';
 import { createServer, DEFAULT_PORT } from '../src/server.js';
 
 const TRUNC = 200;
@@ -32,7 +32,8 @@ const HELP = `bus — local agent chat, claims and tasks
   bus task done <id> ["summary"] [--allow-dirty]  commit first; runs the done-check -> merge request
   bus task merged <id> [--force]        (lead) after merging; verifies the commit is in main
   bus task reassign <id> <agent> | drop <id>                    (lead/human)
-  bus approve <id> | bus reject <id> "why"                      (human)`;
+  bus approve <id> | bus reject <id> "why"                      (human)
+  bus auth reset <agent>                drop an agent's token (BUS_AUTH=1)  (human)`;
 
 function fmt(m) {
   let t = m.text.replace(/\s*\n\s*/g, ' ⏎ ');
@@ -78,7 +79,16 @@ const commands = {
 
   async join() {
     if (!process.env.BUS_AGENT) throw new Error('set BUS_AGENT (and BUS_TEAM) first');
-    const { agent } = await request('POST', '/api/join', { headers: { 'x-bus-cwd': gitRoot() } });
+    const root = gitRoot();
+    const { agent, token } = await request('POST', '/api/join', { headers: { 'x-bus-cwd': root } });
+    if (token) { // BUS_AUTH=1: keep the token in this worktree, git-ignored
+      const fs = await import('node:fs');
+      const file = tokenFile(root, agent.name);
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      const ignore = path.join(root, '.bus', '.gitignore');
+      if (!fs.existsSync(ignore)) fs.writeFileSync(ignore, '*\n');
+      fs.writeFileSync(file, token + '\n', { mode: 0o600 });
+    }
     console.log(`joined as ${agent.name} (team ${agent.team})`);
   },
 
@@ -203,9 +213,15 @@ const commands = {
 
   async hook([sub]) {
     const hooks = await import('../src/hooks.js');
-    const fn = { pre: hooks.preEdit, post: hooks.postTool }[sub];
+    const fn = { pre: hooks.preEdit, post: hooks.postTool, commit: () => hooks.preCommit() }[sub];
     if (!fn) throw new Error(`unknown hook "${sub}"`);
     process.exit(await fn());
+  },
+
+  async auth([sub, agent]) {
+    if (sub !== 'reset' || !agent) throw new Error('usage: bus auth reset <agent>');
+    const r = await request('POST', '/api/auth/reset', { body: { agent } });
+    console.log(r.reset ? `token for ${r.agent} reset — it can bus join again` : `${r.agent} had no token`);
   },
 
   help() { console.log(HELP); },

@@ -44,7 +44,9 @@ The lead session uses `BUS_AGENT=lead`. Commands run without `BUS_AGENT` act as 
 
 - A claim succeeds completely or not at all. Overlap checks for globs are conservative.
 - Paths are repo-relative with forward slashes, and case-insensitive on Windows.
-- The edit-guard hook (exit code 2) blocks Claude Code's Edit/Write/MultiEdit/NotebookEdit on files claimed by another agent. When the bus is down or `BUS_AGENT` is unset, the hook allows the edit silently.
+- The edit-guard hook (exit code 2) blocks Claude Code's Edit/Write/MultiEdit/NotebookEdit on files claimed by another agent. When `BUS_AGENT` is unset it allows the edit silently.
+- **Git pre-commit guard:** `bus init` also installs `pre-commit` in the repo's hooks dir. That's the common dir shared by all worktrees, and `core.hooksPath` is honoured. The guard checks every staged file with the bus and blocks the commit with one line (`bus: commit blocked — <file> is claimed by <agent>; …`) when a file is claimed by another agent, or is a hot file and the committer isn't the lead. This catches edits made through shell commands, which the edit guard can't see. It allows the commit when `BUS_AGENT` is unset (the human), when the bus is down, and when concluding a merge (`MERGE_HEAD` exists, which is the lead merging approved work). An existing pre-commit hook is never overwritten: it's renamed to `pre-commit.pre-bus` and runs first.
+- **Bus down:** if a hook can't reach the bus while `BUS_AGENT` is set, it allows the edit or commit and prints one line once: `bus: server unreachable — edits are NOT being guarded`. The Claude Code hooks put that line in the agent's context and show it to you. A marker file in the temp dir, keyed on agent and port, keeps it to once, and the marker is cleared as soon as the bus answers again.
 
 ## Tasks
 
@@ -81,6 +83,15 @@ Open http://127.0.0.1:4477/ while `bus serve` is running. It shows merge request
 - `bus iface add src/types/ --teams frontend,backend`: when an agent edits an interface, it gets a one-time notice telling it to tell the teams that use it. `bus task done` refuses until it has @mentioned those teams.
 - An agent silent for 30 minutes (`BUS_INACTIVE_MIN`) is marked inactive and the lead is told once. An agent blocked in `bus wait` doesn't count as silent. The lead can then `bus task reassign` or `bus release --of <agent> --all`.
 - Hook notices (PostToolUse) are one line, shown once per new batch of messages, and print nothing at all when nothing is waiting.
+
+## Agent tokens (optional, `BUS_AUTH=1`)
+
+This is off by default, so existing setups keep working. Start the server with `BUS_AUTH=1 bus serve` to turn it on:
+
+- On an agent's first `bus join`, the server issues a random token. The CLI saves it in `<worktree>/.bus/agents/<name>.token`, and `.bus/` gets its own `.gitignore` so the token is never committed. The server keeps only a SHA-256 of the token and never serves it, not even through `/api/state`.
+- Every later request from that agent must send the token. The CLI and the hooks find it by looking upward from the current directory. Without a valid token the request fails with 401, the edit guard and pre-commit guard block, and a token-less `bus join` can't take over the name.
+- Lost a token? The human runs `bus auth reset <agent>`, and the agent joins again.
+- **Limitation:** the human is still identified by sending no `x-bus-agent` header, so a process that unsets `BUS_AGENT` acts as the human. Tokens stop agents impersonating each other; they don't stop an agent impersonating you.
 
 ## Orca
 
