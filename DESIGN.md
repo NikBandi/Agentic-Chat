@@ -29,12 +29,12 @@ Agents are **not** launched automatically. The human starts every session (in Or
    - **assignee**: a specific agent or a team
 3. **Workers start:** the human opens worker sessions, each with a name + team (e.g. `frontend-1` / `frontend`). On startup a worker registers and picks up the task assigned to it; a team-assigned task goes to the first free member of that team. A task whose dependencies aren't merged yet can't be taken.
 4. **Claim on take:** taking a task claims its files. Edits to files claimed by anyone else are blocked (see §5).
-5. **Done-check:** the worker runs `bus task done <id>`. The bus runs the task's done-check **in that worker's worktree**. If it fails, the task stays in progress and the worker sees the failure output (truncated). The lead does **not** re-run the check after merging.
-6. **Merge request:** a passing task becomes a merge request. The lead reviews it and asks the human to approve.
+5. **Done-check:** the worker commits its work on its branch, then runs `bus task done <id>`. The bus refuses if the worktree has uncommitted changes (`git status --porcelain`; `--allow-dirty` overrides, and the bus's own `.bus/` is ignored). It then runs the task's done-check **in that worker's worktree** and records the worktree's HEAD commit on the merge request. If it fails, the task stays in progress and the worker sees the failure output (truncated). The lead does **not** re-run the check after merging.
+6. **Merge request:** a passing task becomes a merge request with a **report**. The worker supplies at most 3 short lines (`--report`: what was built, problems, anything unfinished; more is refused before the check runs). The bus adds everything it already knows: agent, role and team, time since take, files claimed, commit, check runs and the final result, and messages sent and received grouped by counterpart. That costs no agent tokens. The report is stored on the task and appended to `.bus/reports.md`. Only the lead and the human read it (`bus report <id>`, dashboard), and it never enters an agent inbox. The lead reviews it and asks the human to approve.
 7. **Human approval — two ways, both supported:**
    - **Approve / Reject** buttons on the dashboard
    - replying in chat (e.g. `@lead approve #4` / `@lead reject #4 reason`)
-8. **Merge:** after approval the lead merges the task branch. Then automatically:
+8. **Merge:** after approval the lead is told to merge the **reviewed commit** (`merge <sha7>`, not the branch, so later unreviewed commits can't ride along). The merge must be a plain `git merge <sha>`, because squash and rebase rewrite the commit. The lead then runs `bus task merged <id>`. The bus verifies that the recorded commit is in the main branch (`git merge-base --is-ancestor`, run in the lead's worktree or the repo the server started in). The main branch is `BUS_MAIN`, defaulting to `main`, or `master` if `main` doesn't exist. If the commit isn't there, it refuses; `--force` lets the lead override. Then automatically:
    - the task's claims are released
    - owners of tasks that depended on it are mentioned: `#4 merged — rebase and start #7`
 
@@ -86,7 +86,15 @@ These are requirements, not nice-to-haves.
   - Claimed by someone else → block (exit code 2) with a short message telling the agent who owns it and how to ask them.
   - Free → allow. (Optionally auto-claim on first edit.)
   - Bus not running or `BUS_AGENT` unset → allow silently (never get in the way).
-- **Known gap:** the hook only sees Claude Code's edit tools. Writes via shell commands aren't caught; agent instructions forbid working around a block.
+- **Shell writes:** the hook above only sees Claude Code's edit tools. A **git pre-commit hook**, installed by `bus init`, closes the gap at commit time. It checks every staged file and blocks the commit if a file is claimed by another agent, or is a hot file and the committer isn't the lead. It allows the commit when `BUS_AGENT` is unset (the human), when the bus is down, or when the lead concludes a merge. Workers' merge commits are checked like any other. Any existing hook is kept as `pre-commit.pre-bus` and run first. Shell writes can still change the working tree, but they can't be committed.
+- **Bus down is visible:** when a hook can't reach the bus while `BUS_AGENT` is set, it allows the action and prints `bus: server unreachable — edits are NOT being guarded` once. A marker in the temp dir, keyed on agent and port, keeps it to once and is cleared when the bus answers again.
+- **Optional identity proof (`BUS_AUTH=1`, off by default):** `bus join` issues a per-agent token, stored in `<worktree>/.bus/agents/<name>.token` (git-ignored). The server stores only its hash and requires the token on every later request from that agent. `bus auth reset <agent>` (human) recovers a lost one.
+- **Human lock:**
+  - `bus serve` writes a fresh human token to `~/.agentic-chat/<port>.human.token`, outside every repo, and prints `http://127.0.0.1:<port>/#t=<token>`.
+  - The dashboard keeps it in `sessionStorage` and sends it on every request. EventSource can't set headers, so the SSE stream takes it as `?t=`. Human CLI commands read the file.
+  - With `BUS_AUTH=1`, identity-less requests (or the name `you`) without it get 401.
+  - `bus init` adds a PreToolUse hook on `Bash|PowerShell` for agent sessions. It blocks `bus approve|reject|auth`, those API endpoints, any unsetting or overriding of `BUS_AGENT`, and access to `~/.agentic-chat`, each with a one-line reason. It also adds deny rules for `Read`/`Edit(~/.agentic-chat/**)`.
+- **Threat model, honestly:** all of the above guards against agents' mistakes and casual misuse, not against a malicious process running as the same OS user. Such a process can read the token directory with tools the hooks don't see, edit settings or git hooks, or call the 127.0.0.1 API directly. Shell pattern matching is best-effort. Real isolation needs a separate OS user or a container.
 
 ### Hot files — one owner
 Shared files everyone needs (`package.json`, lockfiles, shared types, global config, route registries) are **owned by the lead**. Workers request changes instead of editing:
@@ -113,8 +121,9 @@ The lead applies or declines the request.
 
 ## 6. Dashboard
 
-Local web page served by the bus:
-- agents (name, team, task, active/inactive)
+Local web page served by the bus. It's one self-contained file with no dependencies, built on the same `/api/state` and SSE data. It's designed to be quiet: space instead of boxes, color only for meaning, persimmon only when the human must act, and AA contrast in light and dark. It contains:
+- a "Needs you" area first: merge requests (with report) and unread messages to the human
+- agents (name, team, task, active/inactive), in tabs Active · Waiting (blocked in `bus wait`, from a live `waiting: true` on `/api/state`) · Idle · Done · Inactive, with per-agent history and reports
 - task board (status, owner, dependencies, done-check result)
 - claims
 - team channels + DMs feed, with a composer so the human can post anywhere
@@ -129,7 +138,8 @@ Local web page served by the bus:
 Agent identity comes from env vars set when the human starts the session: `BUS_AGENT` (name) and `BUS_TEAM` (team).
 
 ```
-bus serve                               start the server + dashboard
+bus serve                               start the server + dashboard; prints the dashboard link with the human token
+bus dashboard [--no-open]               (human) print the current tokened dashboard link and open it in the browser
 bus init [project]                      add hooks + agent instructions to a project
 
 bus join                                register (name/team from env)
@@ -148,9 +158,12 @@ bus request <hot-file> "change"         ask the lead to change a hot file
 bus task add "title" --files a,b/ --check "cmd" [--after 3,4] [--for agent|team]   (lead)
 bus task list [--mine]
 bus task take <id>
-bus task done <id> ["summary"]          runs the done-check → merge request
+bus task done <id> ["summary"] [--report "≤3 lines"] [--allow-dirty]   needs committed work; runs the done-check → merge request + report
+bus report <id>                         (lead/human) print the task's report
+bus task merged <id> [--force]          (lead) verifies the commit is in main, then releases claims
 bus task reassign <id> <agent>          (lead/human)
 bus approve <id> | bus reject <id> "why" (human, also via dashboard)
+bus auth reset <agent>                  (human) drop an agent's token when BUS_AUTH=1
 ```
 
 ---

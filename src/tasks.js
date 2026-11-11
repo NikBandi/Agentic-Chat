@@ -2,15 +2,23 @@
 // Lifecycle: open -> in_progress -> review -> approved -> merged      (+ dropped; reject: review -> in_progress)
 import { BusError, HUMAN, LEAD, cleanName } from './bus.js';
 import { normPath } from './paths.js';
-import { runCheck, currentBranch } from './check.js';
+import fs from 'node:fs';
+import path from 'node:path';
+import { runCheck, currentBranch, uncommitted, headSha, mainBranch, isAncestor } from './check.js';
+import { parseReport, buildReport, render } from './report.js';
 
 const NAME_RE = /^[a-z0-9][a-z0-9_-]{0,39}$/;
 const isBoss = (who) => who === LEAD || who === HUMAN;
 const num = (id) => Number(String(id ?? '').replace(/^#/, ''));
+const short = (sha) => String(sha).slice(0, 7);
 
 export class Tasks {
-  constructor(bus) {
+  /** repo: where merges are verified when the lead's worktree is unknown (the dir the server started in). */
+  /** reportsFile: markdown file each passing task's report is appended to (null: don't write one). */
+  constructor(bus, { repo = process.cwd(), reportsFile = null } = {}) {
     this.bus = bus;
+    this.repo = repo;
+    this.reportsFile = reportsFile;
     this.s = bus.s;
     this.s.taskSeq ??= this.s.tasks.reduce((m, t) => Math.max(m, t.id), 0);
     this.running = new Set();
@@ -43,7 +51,7 @@ export class Tasks {
     const t = {
       id: ++this.s.taskSeq, title, brief: String(brief), files: [...new Set(files.map(normPath).filter(Boolean))],
       check, after: deps, assignee, status: 'open', owner: null, offered: [],
-      timeout: Math.min(Math.max(1, Number(timeout) || 600), 3600), result: null, summary: '', branch: null,
+      timeout: Math.min(Math.max(1, Number(timeout) || 600), 3600), result: null, summary: '', branch: null, commit: null,
       createdAt: now, updatedAt: now,
     };
     this.s.tasks.push(t);
@@ -106,18 +114,19 @@ export class Tasks {
         throw new BusError(`can't claim ${c} — ask the owner or @lead`, 409);
       }
     }
-    Object.assign(t, { owner: who, status: 'in_progress' });
+    Object.assign(t, { owner: who, status: 'in_progress', takenAt: Date.now(), checkRuns: 0, checkFails: 0 });
     a.task = t.id;
     this.bus.log(`${who} took #${t.id}`);
     this.#touch(t);
     return t;
   }
 
-  /** Runs the done-check in the owner's worktree. Pass -> merge request for the lead. */
-  async done(who, id, summary = '') {
+  /** Runs the done-check in the owner's worktree (which must be committed). Pass -> merge request for the lead. */
+  async done(who, id, summary = '', { allowDirty = false, report = '' } = {}) {
     const t = this.get(id);
     if (t.owner !== who) throw new BusError(`#${t.id} is not yours`, 403);
     if (t.status !== 'in_progress') throw new BusError(`#${t.id} is ${t.status}`, 409);
+    const notes = parseReport(report); // refuse a bad --report before spending a check run
     if (this.running.has(t.id)) throw new BusError(`#${t.id} check already running`, 409);
     const a = this.s.agents[who];
     if (!a.worktree) throw new BusError('worktree unknown — run bus join from your worktree', 400);
@@ -127,9 +136,17 @@ export class Tasks {
       throw new BusError(`announce your interface change first: bus send ${teams.map((x) => '@' + x).join(' ')} "<what changed in ${p}>"`, 409);
     }
     this.running.add(t.id);
-    let r;
-    try { r = await runCheck(t.check, a.worktree, t.timeout); }
-    finally { this.running.delete(t.id); }
+    let r, commit;
+    try {
+      if (!allowDirty) {
+        const n = await uncommitted(a.worktree); // null: not a git worktree, nothing to enforce
+        if (n) throw new BusError(`commit your changes first (${n} file${n === 1 ? '' : 's'} uncommitted)`, 409);
+      }
+      commit = await headSha(a.worktree); // the commit the check runs against
+      r = await runCheck(t.check, a.worktree, t.timeout);
+      t.checkRuns = (t.checkRuns ?? 0) + 1;
+      if (!r.ok) t.checkFails = (t.checkFails ?? 0) + 1;
+    } finally { this.running.delete(t.id); }
     t.result = { ok: r.ok, code: r.code, output: r.output, ms: r.ms, ts: Date.now() };
     if (t.status !== 'in_progress' || t.owner !== who) { this.#touch(t); throw new BusError(`#${t.id} changed while the check ran (${t.status})`, 409); }
     if (!r.ok) {
@@ -138,15 +155,41 @@ export class Tasks {
       return { ok: false, code: r.code, output: r.output };
     }
     t.branch = await currentBranch(a.worktree);
+    t.commit = commit;
     t.summary = String(summary || '').trim();
     t.status = 'review';
-    const mr = { task: t.id, agent: who, branch: t.branch, summary: t.summary, status: 'pending', reason: '', ts: Date.now() };
+    const mr = { task: t.id, agent: who, branch: t.branch, commit: t.commit, summary: t.summary, status: 'pending', reason: '', ts: Date.now() };
     this.s.mergeRequests = this.s.mergeRequests.filter((m) => m.task !== t.id);
     this.s.mergeRequests.push(mr);
+    this.#report(t, a, notes);
     this.bus.log(`#${t.id} passed its check — merge request from ${who}`);
-    this.bus.notify(LEAD, `#${t.id} passed its check (${who}, branch ${t.branch ?? '?'})${t.summary ? ': ' + t.summary : ''} — review, then ask @you to approve`);
+    this.bus.notify(LEAD, `#${t.id} passed its check (${who}, branch ${t.branch ?? '?'})${t.summary ? ': ' + t.summary : ''} — review (bus report ${t.id}), then ask @you to approve`);
     this.#touch(t);
     return { ok: true, mr };
+  }
+
+  /** Build the report from the bus's own records (no agent tokens), store it, append it to reports.md. Never sent to inboxes. */
+  #report(t, a, notes) {
+    const rep = buildReport({
+      task: t, agent: a, notes,
+      claims: this.bus.claims(a.name).map((c) => c.path),
+      messages: this.s.messages,
+      isFor: (m, ag) => this.bus.isFor(m, ag),
+    });
+    t.report = { ...rep, text: render(rep) };
+    if (!this.reportsFile) return;
+    try {
+      fs.mkdirSync(path.dirname(this.reportsFile), { recursive: true });
+      fs.appendFileSync(this.reportsFile, render(rep, { md: true }) + '\n');
+    } catch (e) { this.bus.log(`couldn't append report for #${t.id}: ${e.message}`); }
+  }
+
+  /** The stored report text: lead or human only. */
+  report(who, id) {
+    if (!isBoss(who)) throw new BusError('only the lead or the human can read reports', 403);
+    const t = this.get(id);
+    if (!t.report) throw new BusError(`#${t.id} has no report yet — one is written when its done-check passes`, 404);
+    return t.report.text;
   }
 
   approve(who, id) {
@@ -156,7 +199,9 @@ export class Tasks {
     t.status = 'approved';
     Object.assign(this.#mr(t), { status: 'approved' });
     this.bus.log(`#${t.id} approved`);
-    this.bus.notify(LEAD, `#${t.id} approved — merge ${t.branch ?? 'its branch'}, then: bus task merged ${t.id}`);
+    // Name the reviewed commit, not the branch: commits added to the branch after approval must not ride along.
+    const what = t.commit ? `${short(t.commit)} (git merge ${short(t.commit)}; not the branch)` : (t.branch ?? 'its branch');
+    this.bus.notify(LEAD, `#${t.id} approved — merge ${what}, then: bus task merged ${t.id}`);
     this.#touch(t);
     return t;
   }
@@ -175,11 +220,33 @@ export class Tasks {
     return t;
   }
 
-  /** Lead reports the branch is merged: release claims, hand off to dependents, free the owner. */
-  merged(who, id) {
+  /**
+   * Lead reports the branch is merged: verify the recorded commit is in the main branch, then release claims,
+   * hand off to dependents, free the owner. Permission/state errors throw synchronously; returns a Promise of the task.
+   * force skips the git verification. Tasks with no recorded commit (not a git worktree) aren't verified.
+   */
+  merged(who, id, { force = false } = {}) {
     if (!isBoss(who)) throw new BusError('only the lead marks tasks merged', 403);
     const t = this.get(id);
     if (t.status !== 'approved') throw new BusError(`#${t.id} is ${t.status} — it needs human approval first`, 409);
+    if (!t.commit || force) {
+      if (t.commit) this.bus.log(`#${t.id} marked merged with --force (${short(t.commit)} unverified)`);
+      return Promise.resolve(this.#finishMerge(t));
+    }
+    return this.#verifyMerge(t);
+  }
+
+  async #verifyMerge(t) {
+    const dir = this.s.agents[LEAD]?.worktree || this.repo;
+    const main = await mainBranch(dir);
+    const r = await isAncestor(t.commit, main, dir);
+    if (t.status !== 'approved') throw new BusError(`#${t.id} changed while verifying (${t.status})`, 409);
+    if (r.err) throw new BusError(`can't verify ${short(t.commit)} in ${main}: ${r.err} — merge it, or use --force`, 409);
+    if (!r.in) throw new BusError(`${short(t.commit)} is not in ${main} yet — merge it first with plain git merge ${short(t.commit)} (no squash or rebase)`, 409);
+    return this.#finishMerge(t);
+  }
+
+  #finishMerge(t) {
     t.status = 'merged';
     Object.assign(this.#mr(t), { status: 'merged' });
     this.#free(t);
@@ -199,7 +266,7 @@ export class Tasks {
     const old = t.owner;
     this.#free(t);
     this.s.mergeRequests = this.s.mergeRequests.filter((m) => m.task !== t.id);
-    Object.assign(t, { owner: null, status: 'open', assignee: to, offered: [] });
+    Object.assign(t, { owner: null, status: 'open', assignee: to, offered: [], branch: null, commit: null });
     this.bus.log(`#${t.id} reassigned ${old ?? '-'} -> ${to}`);
     if (old && old !== to) { this.bus.notify(old, `#${t.id} was reassigned to ${to} — stop work on it`); this.offerNext(old); }
     this.offer(t);

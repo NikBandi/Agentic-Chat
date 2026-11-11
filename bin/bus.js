@@ -2,7 +2,9 @@
 // `bus` CLI. Output is deliberately terse: one line per item, no decoration (agents pay for every token).
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { request } from '../src/client.js';
+import { spawn } from 'node:child_process';
+import { request, tokenFile, baseUrl } from '../src/client.js';
+import { writeHumanToken, removeHumanToken, readHumanToken, humanTokenFile, openCommand } from '../src/human.js';
 import { createServer, DEFAULT_PORT } from '../src/server.js';
 
 const TRUNC = 200;
@@ -29,10 +31,13 @@ const HELP = `bus — local agent chat, claims and tasks
   bus task add "title" --files a,b/ --check "cmd" [--after 3,4] [--for agent|team]
                [--brief "text" | --brief-file f] [--timeout secs]          (lead)
   bus task list [--mine] | show <id> | take <id>
-  bus task done <id> ["summary"]        run the done-check -> merge request
-  bus task merged <id>                  (lead) after merging the approved branch
+  bus task done <id> ["summary"] [--report "≤3 lines"] [--allow-dirty]  commit first; runs the done-check -> merge request
+  bus report <id>                       the task's report (lead/human)
+  bus task merged <id> [--force]        (lead) after merging; verifies the commit is in main
   bus task reassign <id> <agent> | drop <id>                    (lead/human)
-  bus approve <id> | bus reject <id> "why"                      (human)`;
+  bus approve <id> | bus reject <id> "why"                      (human)
+  bus auth reset <agent>                drop an agent's token (BUS_AUTH=1)  (human)
+  bus dashboard [--no-open]             print + open the dashboard link with your token  (human)`;
 
 function fmt(m) {
   let t = m.text.replace(/\s*\n\s*/g, ' ⏎ ');
@@ -70,15 +75,26 @@ const commands = {
     const dataFile = path.resolve(takeFlag(args, '--data', true) || process.env.BUS_DATA || '.bus/state.json');
     const srv = createServer({ port, dataFile });
     const p = await srv.listen();
+    writeHumanToken(p, srv.humanToken);
     console.log(`bus listening on http://127.0.0.1:${p} (data: ${dataFile})`);
-    const stop = async () => { await srv.close(); process.exit(0); };
+    console.log(`dashboard: http://127.0.0.1:${p}/#t=${srv.humanToken}`);
+    const stop = async () => { removeHumanToken(p, srv.humanToken); await srv.close(); process.exit(0); };
     process.on('SIGINT', stop);
     process.on('SIGTERM', stop);
   },
 
   async join() {
     if (!process.env.BUS_AGENT) throw new Error('set BUS_AGENT (and BUS_TEAM) first');
-    const { agent } = await request('POST', '/api/join', { headers: { 'x-bus-cwd': gitRoot() } });
+    const root = gitRoot();
+    const { agent, token } = await request('POST', '/api/join', { headers: { 'x-bus-cwd': root } });
+    if (token) { // BUS_AUTH=1: keep the token in this worktree, git-ignored
+      const fs = await import('node:fs');
+      const file = tokenFile(root, agent.name);
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      const ignore = path.join(root, '.bus', '.gitignore');
+      if (!fs.existsSync(ignore)) fs.writeFileSync(ignore, '*\n');
+      fs.writeFileSync(file, token + '\n', { mode: 0o600 });
+    }
     console.log(`joined as ${agent.name} (team ${agent.team})`);
   },
 
@@ -203,9 +219,39 @@ const commands = {
 
   async hook([sub]) {
     const hooks = await import('../src/hooks.js');
-    const fn = { pre: hooks.preEdit, post: hooks.postTool }[sub];
+    const fn = { pre: hooks.preEdit, post: hooks.postTool, bash: hooks.preBash, commit: () => hooks.preCommit() }[sub];
     if (!fn) throw new Error(`unknown hook "${sub}"`);
     process.exit(await fn());
+  },
+
+  async report([id]) {
+    if (!id) throw new Error('usage: bus report <id>');
+    console.log((await request('GET', '/api/task/report', { query: { id } })).report);
+  },
+
+  async dashboard(args) {
+    if (process.env.BUS_AGENT) throw new Error('bus dashboard is for the human — run it without BUS_AGENT');
+    const noOpen = takeFlag(args, '--no-open');
+    const base = new URL(baseUrl());
+    const port = base.port || '80';
+    const token = readHumanToken(port);
+    if (!token) throw new Error(`no human token for port ${port} — start the server with bus serve (it writes ${humanTokenFile(port)})`);
+    await request('GET', '/api/who'); // server up? token current? (401 under BUS_AUTH if it's from an older bus serve)
+    const url = `${base.origin}/#t=${token}`;
+    console.log(url);
+    if (noOpen) return;
+    const [cmd, cmdArgs] = openCommand(url);
+    try {
+      const p = spawn(cmd, cmdArgs, { detached: true, stdio: 'ignore', windowsHide: true });
+      p.on('error', () => console.error('bus: could not open a browser — open the link above'));
+      p.unref();
+    } catch { console.error('bus: could not open a browser — open the link above'); }
+  },
+
+  async auth([sub, agent]) {
+    if (sub !== 'reset' || !agent) throw new Error('usage: bus auth reset <agent>');
+    const r = await request('POST', '/api/auth/reset', { body: { agent } });
+    console.log(r.reset ? `token for ${r.agent} reset — it can bus join again` : `${r.agent} had no token`);
   },
 
   help() { console.log(HELP); },
@@ -224,6 +270,7 @@ function taskDetail(t) {
     taskLine(t),
     `files: ${t.files.join(' ') || '-'}`,
     `check: ${t.check}`,
+    t.commit && `commit: ${t.commit.slice(0, 7)} on ${t.branch ?? '?'}`,
     t.brief && `\n${t.brief}`,
   ].filter(Boolean).join('\n');
 }
@@ -259,15 +306,19 @@ const taskCommands = {
     console.log(`took ${taskDetail(t)}`);
   },
 
-  async done([id, ...summary]) {
-    const r = await request('POST', '/api/task/done', { body: { id, summary: summary.join(' ') }, headers: { 'x-bus-cwd': gitRoot() } });
+  async done(args) {
+    const allowDirty = takeFlag(args, '--allow-dirty');
+    const report = takeFlag(args, '--report', true) || '';
+    const [id, ...summary] = args;
+    const r = await request('POST', '/api/task/done', { body: { id, summary: summary.join(' '), allowDirty, report }, headers: { 'x-bus-cwd': gitRoot() } });
     if (r.ok) return console.log(`check passed — #${r.mr.task} sent to @lead for review`);
     console.log(`check failed (exit ${r.code}) — fix and rerun bus task done ${id}\n${r.output}`);
     process.exitCode = 1;
   },
 
-  async merged([id]) {
-    const { task: t } = await request('POST', '/api/task/merged', { body: { id } });
+  async merged(args) {
+    const force = takeFlag(args, '--force');
+    const { task: t } = await request('POST', '/api/task/merged', { body: { id: args[0], force } });
     console.log(`#${t.id} merged — claims released, dependents notified`);
   },
 

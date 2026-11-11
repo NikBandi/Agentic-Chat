@@ -3,6 +3,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { execFileSync } from 'node:child_process';
 
 const BUS_BIN = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'bin', 'bus.js');
 const START = '<!-- agent-bus -->';
@@ -15,22 +16,31 @@ export const AGENT_RULES = `${START}
 - Edit only files your task claims. If an edit is blocked, ask the owner (\`bus send @owner "..."\`); never work around it with shell writes.
 - Hot files (package.json, lockfiles, shared types, global config): \`bus request <file> "change"\` instead of editing.
 - When a hook notice says something is waiting, run \`bus read\`. Never poll. Blocked on someone? \`bus wait\`.
-- Done: \`bus task done <id> "summary"\` runs the done-check; fix failures and retry.
+- Commit your work on your branch before bus task done.
+- Lead: Merge with plain \`git merge <sha>\` — no squash or rebase.
+- Done: \`bus task done <id> "summary"\` runs the done-check; fix failures and retry. On bus task done, include --report with up to 3 lines.
 - Keep messages short; @mention only who must act. Full text of a truncated message: \`bus show <id>\`.
 ${END}`;
 
 const hookCmd = (sub) => `node "${BUS_BIN.replace(/\\/g, '/')}" hook ${sub}`;
 
-export const HOOKS = {
-  PreToolUse: { matcher: 'Edit|Write|MultiEdit|NotebookEdit', sub: 'pre' },
-  PostToolUse: { matcher: '*', sub: 'post' },
-};
+export const HOOKS = [
+  { event: 'PreToolUse', matcher: 'Edit|Write|MultiEdit|NotebookEdit', sub: 'pre' },
+  { event: 'PreToolUse', matcher: 'Bash|PowerShell', sub: 'bash' },
+  { event: 'PostToolUse', matcher: '*', sub: 'post' },
+];
 
-/** Add (or update) our hook entries in a settings object. Returns true if it changed. */
+/** Agents may not read (or write) the human's token directory. */
+export const DENY = ['Read(~/.agentic-chat/**)', 'Edit(~/.agentic-chat/**)'];
+
+/** Add (or update) our hook entries and deny rules in a settings object. Returns true if it changed. */
 export function mergeSettings(settings) {
   let changed = false;
   settings.hooks ??= {};
-  for (const [event, { matcher, sub }] of Object.entries(HOOKS)) {
+  settings.permissions ??= {};
+  const deny = (settings.permissions.deny ??= []);
+  for (const rule of DENY) if (!deny.includes(rule)) { deny.push(rule); changed = true; }
+  for (const { event, matcher, sub } of HOOKS) {
     const list = (settings.hooks[event] ??= []);
     const cmd = hookCmd(sub);
     const isOurs = (h) => typeof h.command === 'string' && /bus\.js"? hook /.test(h.command) && h.command.endsWith(` hook ${sub}`);
@@ -44,6 +54,49 @@ export function mergeSettings(settings) {
     }
   }
   return changed;
+}
+
+export const GIT_HOOK_MARK = '# agent-bus pre-commit';
+export const CHAINED = 'pre-commit.pre-bus';
+
+/** Shell script for .git/hooks/pre-commit: run any hook it replaced, then the bus claim guard. */
+export const gitHookScript = () => `#!/bin/sh
+${GIT_HOOK_MARK} — installed by \`bus init\`. Blocks commits of files claimed by another agent.
+# A pre-commit hook that was here before is kept as ${CHAINED} and runs first.
+hook_dir=$(dirname "$0")
+if [ -x "$hook_dir/${CHAINED}" ]; then "$hook_dir/${CHAINED}" "$@" || exit $?; fi
+[ -z "$BUS_AGENT" ] && exit 0
+exec node "${BUS_BIN.replace(/\\/g, '/')}" hook commit
+`;
+
+/**
+ * Install the git pre-commit hook into the repo's hooks dir (honours core.hooksPath and worktrees' common dir).
+ * Never overwrites a foreign hook: it is renamed to pre-commit.pre-bus and chained. Returns a status line.
+ */
+export function installGitHook(dir) {
+  let hooks;
+  try {
+    hooks = execFileSync('git', ['rev-parse', '--git-path', 'hooks'], { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+  } catch { return `not a git repo — skipped pre-commit hook in ${dir}`; }
+  hooks = path.resolve(dir, hooks);
+  fs.mkdirSync(hooks, { recursive: true });
+  const file = path.join(hooks, 'pre-commit');
+  const script = gitHookScript();
+  if (fs.existsSync(file)) {
+    const cur = fs.readFileSync(file, 'utf8');
+    if (cur.includes(GIT_HOOK_MARK)) {
+      if (cur === script) return `pre-commit hook already current in ${hooks}`;
+      fs.writeFileSync(file, script, { mode: 0o755 });
+      return `updated pre-commit hook in ${hooks}`;
+    }
+    const chained = path.join(hooks, CHAINED);
+    if (fs.existsSync(chained)) return `left existing pre-commit hook alone (${CHAINED} already exists) in ${hooks}`;
+    fs.renameSync(file, chained);
+    fs.writeFileSync(file, script, { mode: 0o755 });
+    return `installed pre-commit hook in ${hooks} (chains to your previous hook, now ${CHAINED})`;
+  }
+  fs.writeFileSync(file, script, { mode: 0o755 });
+  return `installed pre-commit hook in ${hooks}`;
 }
 
 /** Insert or replace the marked agent-rules block. */
@@ -74,5 +127,6 @@ export function init(projectDir = process.cwd()) {
   const after = mergeClaudeMd(before);
   if (after !== before) { fs.writeFileSync(mdFile, after); out.push(`updated ${mdFile}`); }
   else out.push(`agent rules already current in ${mdFile}`);
+  out.push(installGitHook(dir));
   return out;
 }

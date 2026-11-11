@@ -122,6 +122,40 @@ describe('server', () => {
     assert.equal(r.data.timeout, true);
   }));
 
+  test('/api/state marks agents waiting:true only while blocked in bus wait, never persisted', () => withServer(async ({ call, port, dataFile }) => {
+    await call('POST', '/api/join', { agent: 'bob', team: 'fe' });
+    await call('POST', '/api/join', { agent: 'carol', team: 'fe' });
+    const st = async () => (await call('GET', '/api/state')).data.agents;
+    assert.equal((await st()).bob.waiting, undefined);
+    // the dashboard hears about it: entering bus wait sends a change event
+    const ac = new AbortController();
+    const ev = await fetch(`http://127.0.0.1:${port}/api/events`, { signal: ac.signal });
+    const reader = ev.body.getReader();
+    const waiting = call('POST', '/api/wait?secs=5', { agent: 'bob' });
+    let got = '';
+    while (!got.includes('event: change')) got += new TextDecoder().decode((await reader.read()).value);
+    ac.abort();
+    const a = await st();
+    assert.equal(a.bob.waiting, true);
+    assert.equal(a.carol.waiting, undefined);
+    await new Promise((r) => setTimeout(r, 120)); // let the debounced save land
+    assert.ok(!fs.readFileSync(dataFile, 'utf8').includes('"waiting"'));
+    await call('POST', '/api/send', { agent: 'carol', team: 'fe', body: { to: '@bob', text: 'go' } });
+    await waiting;
+    assert.equal((await st()).bob.waiting, undefined);
+  }));
+
+  test('/api/state drops waiting when the bus wait client disconnects', () => withServer(async ({ call, port }) => {
+    await call('POST', '/api/join', { agent: 'bob', team: 'fe' });
+    const ac = new AbortController();
+    const p = fetch(`http://127.0.0.1:${port}/api/wait?secs=5`, { method: 'POST', headers: { 'x-bus-agent': 'bob' }, signal: ac.signal }).catch(() => null);
+    await new Promise((r) => setTimeout(r, 100));
+    assert.equal((await call('GET', '/api/state')).data.agents.bob.waiting, true);
+    ac.abort(); await p;
+    await new Promise((r) => setTimeout(r, 100));
+    assert.equal((await call('GET', '/api/state')).data.agents.bob.waiting, undefined);
+  }));
+
   test('/api/wait?secs=1 returns {timeout:true} with nothing', () => withServer(async ({ call }) => {
     await call('POST', '/api/join', { agent: 'bob', team: 'fe' });
     const t0 = Date.now();

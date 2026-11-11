@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { mergeSettings, mergeClaudeMd, init } from '../src/init.js';
+import { mergeSettings, mergeClaudeMd, init, AGENT_RULES } from '../src/init.js';
 import { createServer } from '../src/server.js';
 
 const BIN = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'bin', 'bus.js');
@@ -15,9 +15,11 @@ describe('bus init', () => {
     const s = { permissions: { allow: ['Bash(ls)'] }, hooks: { PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: 'other' }] }] } };
     assert.equal(mergeSettings(s), true);
     assert.equal(mergeSettings(s), false);
-    assert.deepEqual(s.permissions, { allow: ['Bash(ls)'] });
-    assert.equal(s.hooks.PreToolUse.length, 2);
+    assert.deepEqual(s.permissions.allow, ['Bash(ls)']);
+    assert.equal(s.hooks.PreToolUse.length, 3);
     assert.equal(s.hooks.PreToolUse[1].matcher, 'Edit|Write|MultiEdit|NotebookEdit');
+    assert.equal(s.hooks.PreToolUse[2].matcher, 'Bash|PowerShell');
+    assert.match(s.hooks.PreToolUse[2].hooks[0].command, / hook bash$/);
     assert.equal(s.hooks.PostToolUse[0].matcher, '*');
     assert.match(s.hooks.PostToolUse[0].hooks[0].command, / hook post$/);
   });
@@ -29,6 +31,12 @@ describe('bus init', () => {
     const stale = '# P\n<!-- agent-bus -->\nold\n<!-- /agent-bus -->\ntail\n';
     const fresh = mergeClaudeMd(stale);
     assert.ok(!fresh.includes('\nold\n') && fresh.endsWith('tail\n'));
+  });
+
+  test('agent rules: commit before done, lead merges the sha plainly, block stays ~10 lines', () => {
+    assert.match(AGENT_RULES, /^- Commit your work on your branch before bus task done\.$/m);
+    assert.match(AGENT_RULES, /^- Lead: Merge with plain `git merge <sha>` — no squash or rebase\.$/m);
+    assert.ok(AGENT_RULES.split('\n').length <= 12, 'rules block (incl. markers) must stay short');
   });
 
   test('init writes files and refuses invalid settings JSON', () => {
@@ -78,12 +86,11 @@ describe('PreToolUse edit guard', () => {
     const nb = { cwd: repo, tool_name: 'NotebookEdit', tool_input: { notebook_path: path.join(repo, 'src', 'api', 'n.ipynb') } };
     assert.equal((await run({ BUS_AGENT: 'bob', BUS_TEAM: 'be' }, nb)).status, 2);
   });
-  test('allows owner, free files, no identity, and a down server — silently', async () => {
+  test('allows owner, free files and no identity — silently (bus-down warning: test/guard.test.js)', async () => {
     for (const r of await Promise.all([
       run({ BUS_AGENT: 'alice', BUS_TEAM: 'fe' }, edit(path.join(repo, 'src', 'api', 'u.ts'))),
       run({ BUS_AGENT: 'bob', BUS_TEAM: 'be' }, edit(path.join(repo, 'README.md'))),
       run({}, edit(path.join(repo, 'src', 'api', 'u.ts'))),
-      run({ BUS_AGENT: 'bob', BUS_TEAM: 'be', BUS_URL: 'http://127.0.0.1:1' }, edit(path.join(repo, 'src', 'api', 'u.ts'))),
     ])) { assert.equal(r.status, 0); assert.equal(r.stdout + r.stderr, ''); }
   });
 
@@ -91,10 +98,10 @@ describe('PreToolUse edit guard', () => {
     const post = (env) => run(env, { tool_name: 'Bash', tool_input: { command: 'ls' } }, 'post');
     const carol = { BUS_AGENT: 'carol', BUS_TEAM: 'qa' };
 
-    test('silent when nothing is waiting, without identity, or with the server down', async () => {
+    test('silent when nothing is waiting or without identity', async () => {
       srv.bus.touch('carol', 'qa');
       srv.bus.read('carol');
-      for (const r of await Promise.all([post(carol), post({}), post({ ...carol, BUS_URL: 'http://127.0.0.1:1' })])) {
+      for (const r of await Promise.all([post(carol), post({})])) {
         assert.equal(r.status, 0);
         assert.equal(r.stdout + r.stderr, '');
       }
