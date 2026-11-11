@@ -3,6 +3,7 @@
 import http from 'node:http';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
+import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Bus, BusError, HUMAN, cleanName } from './bus.js';
 import { Store } from './store.js';
@@ -21,7 +22,7 @@ export function createServer({
 } = {}) {
   const store = new Store(dataFile);
   const bus = new Bus(store);
-  const tasks = new Tasks(bus, { repo: repoDir });
+  const tasks = new Tasks(bus, { repo: repoDir, reportsFile: dataFile ? path.join(path.dirname(dataFile), 'reports.md') : null });
   bus.s.tokens ??= {}; // agent -> sha256(token); never served
 
   /** BUS_AUTH: an agent with a token must present it; an agent without one may only join (and gets one). */
@@ -113,7 +114,8 @@ export function createServer({
     'GET /api/task/list': ({ who, q }) => ({ tasks: tasks.list(who, !!q.get('mine')) }),
     'GET /api/task/show': ({ q }) => ({ task: tasks.get(q.get('id')) }),
     'POST /api/task/take': ({ who, body }) => ({ task: tasks.take(need(who), body.id) }),
-    'POST /api/task/done': ({ who, body }) => tasks.done(need(who), body.id, body.summary, { allowDirty: !!body.allowDirty }),
+    'POST /api/task/done': ({ who, body }) => tasks.done(need(who), body.id, body.summary, { allowDirty: !!body.allowDirty, report: body.report }),
+    'GET /api/task/report': ({ who, q }) => ({ report: tasks.report(who, q.get('id')) }),
     'POST /api/task/merged': async ({ who, body }) => ({ task: await tasks.merged(who, body.id, { force: !!body.force }) }),
     'POST /api/task/reassign': ({ who, body }) => ({ task: tasks.reassign(who, body.id, body.to) }),
     'POST /api/task/drop': ({ who, body }) => ({ task: tasks.drop(who, body.id) }),

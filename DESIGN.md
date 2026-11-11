@@ -157,7 +157,8 @@ bus request <hot-file> "change"         ask the lead to change a hot file
 bus task add "title" --files a,b/ --check "cmd" [--after 3,4] [--for agent|team]   (lead)
 bus task list [--mine]
 bus task take <id>
-bus task done <id> ["summary"] [--allow-dirty]   needs committed work; runs the done-check → merge request
+bus task done <id> ["summary"] [--report "≤3 lines"] [--allow-dirty]   needs committed work; runs the done-check → merge request + report
+bus report <id>                         (lead/human) print the task's report
 bus task merged <id> [--force]          (lead) verifies the commit is in main, then releases claims
 bus task reassign <id> <agent>          (lead/human)
 bus approve <id> | bus reject <id> "why" (human, also via dashboard)

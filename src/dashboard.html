@@ -213,6 +213,7 @@ function renderMR() {
         h('span', { class: 'tag' }, mr.branch || t.branch || 'no branch'),
         (mr.commit || t.commit) ? h('span', { class: 'tag', title: mr.commit || t.commit }, (mr.commit || t.commit).slice(0, 7)) : null, h('span', { class: 'mute' }, ago(mr.ts || t.updatedAt))),
       (mr.summary || t.summary) ? h('div', {}, mr.summary || t.summary) : null,
+      t.report ? h('details', {}, h('summary', {}, 'Report'), h('pre', { class: 'msg' }, t.report.text)) : null,
       h('div', {}, checkBadge(t)), outPre(t),
       rej ? h('form', { class: 'row', onsubmit: (e) => { e.preventDefault(); rejecting.delete(t.id); api('/api/reject', { id: t.id, why: why.value }); } },
           h('label', { class: 'sr', for: 'why' + t.id }, 'Reject reason'),

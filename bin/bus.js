@@ -31,7 +31,8 @@ const HELP = `bus — local agent chat, claims and tasks
   bus task add "title" --files a,b/ --check "cmd" [--after 3,4] [--for agent|team]
                [--brief "text" | --brief-file f] [--timeout secs]          (lead)
   bus task list [--mine] | show <id> | take <id>
-  bus task done <id> ["summary"] [--allow-dirty]  commit first; runs the done-check -> merge request
+  bus task done <id> ["summary"] [--report "≤3 lines"] [--allow-dirty]  commit first; runs the done-check -> merge request
+  bus report <id>                       the task's report (lead/human)
   bus task merged <id> [--force]        (lead) after merging; verifies the commit is in main
   bus task reassign <id> <agent> | drop <id>                    (lead/human)
   bus approve <id> | bus reject <id> "why"                      (human)
@@ -223,6 +224,11 @@ const commands = {
     process.exit(await fn());
   },
 
+  async report([id]) {
+    if (!id) throw new Error('usage: bus report <id>');
+    console.log((await request('GET', '/api/task/report', { query: { id } })).report);
+  },
+
   async dashboard(args) {
     if (process.env.BUS_AGENT) throw new Error('bus dashboard is for the human — run it without BUS_AGENT');
     const noOpen = takeFlag(args, '--no-open');
@@ -302,8 +308,9 @@ const taskCommands = {
 
   async done(args) {
     const allowDirty = takeFlag(args, '--allow-dirty');
+    const report = takeFlag(args, '--report', true) || '';
     const [id, ...summary] = args;
-    const r = await request('POST', '/api/task/done', { body: { id, summary: summary.join(' '), allowDirty }, headers: { 'x-bus-cwd': gitRoot() } });
+    const r = await request('POST', '/api/task/done', { body: { id, summary: summary.join(' '), allowDirty, report }, headers: { 'x-bus-cwd': gitRoot() } });
     if (r.ok) return console.log(`check passed — #${r.mr.task} sent to @lead for review`);
     console.log(`check failed (exit ${r.code}) — fix and rerun bus task done ${id}\n${r.output}`);
     process.exitCode = 1;

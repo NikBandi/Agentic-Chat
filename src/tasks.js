@@ -2,7 +2,10 @@
 // Lifecycle: open -> in_progress -> review -> approved -> merged      (+ dropped; reject: review -> in_progress)
 import { BusError, HUMAN, LEAD, cleanName } from './bus.js';
 import { normPath } from './paths.js';
+import fs from 'node:fs';
+import path from 'node:path';
 import { runCheck, currentBranch, uncommitted, headSha, mainBranch, isAncestor } from './check.js';
+import { parseReport, buildReport, render } from './report.js';
 
 const NAME_RE = /^[a-z0-9][a-z0-9_-]{0,39}$/;
 const isBoss = (who) => who === LEAD || who === HUMAN;
@@ -11,9 +14,11 @@ const short = (sha) => String(sha).slice(0, 7);
 
 export class Tasks {
   /** repo: where merges are verified when the lead's worktree is unknown (the dir the server started in). */
-  constructor(bus, { repo = process.cwd() } = {}) {
+  /** reportsFile: markdown file each passing task's report is appended to (null: don't write one). */
+  constructor(bus, { repo = process.cwd(), reportsFile = null } = {}) {
     this.bus = bus;
     this.repo = repo;
+    this.reportsFile = reportsFile;
     this.s = bus.s;
     this.s.taskSeq ??= this.s.tasks.reduce((m, t) => Math.max(m, t.id), 0);
     this.running = new Set();
@@ -109,7 +114,7 @@ export class Tasks {
         throw new BusError(`can't claim ${c} — ask the owner or @lead`, 409);
       }
     }
-    Object.assign(t, { owner: who, status: 'in_progress' });
+    Object.assign(t, { owner: who, status: 'in_progress', takenAt: Date.now(), checkRuns: 0, checkFails: 0 });
     a.task = t.id;
     this.bus.log(`${who} took #${t.id}`);
     this.#touch(t);
@@ -117,10 +122,11 @@ export class Tasks {
   }
 
   /** Runs the done-check in the owner's worktree (which must be committed). Pass -> merge request for the lead. */
-  async done(who, id, summary = '', { allowDirty = false } = {}) {
+  async done(who, id, summary = '', { allowDirty = false, report = '' } = {}) {
     const t = this.get(id);
     if (t.owner !== who) throw new BusError(`#${t.id} is not yours`, 403);
     if (t.status !== 'in_progress') throw new BusError(`#${t.id} is ${t.status}`, 409);
+    const notes = parseReport(report); // refuse a bad --report before spending a check run
     if (this.running.has(t.id)) throw new BusError(`#${t.id} check already running`, 409);
     const a = this.s.agents[who];
     if (!a.worktree) throw new BusError('worktree unknown — run bus join from your worktree', 400);
@@ -138,6 +144,8 @@ export class Tasks {
       }
       commit = await headSha(a.worktree); // the commit the check runs against
       r = await runCheck(t.check, a.worktree, t.timeout);
+      t.checkRuns = (t.checkRuns ?? 0) + 1;
+      if (!r.ok) t.checkFails = (t.checkFails ?? 0) + 1;
     } finally { this.running.delete(t.id); }
     t.result = { ok: r.ok, code: r.code, output: r.output, ms: r.ms, ts: Date.now() };
     if (t.status !== 'in_progress' || t.owner !== who) { this.#touch(t); throw new BusError(`#${t.id} changed while the check ran (${t.status})`, 409); }
@@ -153,10 +161,35 @@ export class Tasks {
     const mr = { task: t.id, agent: who, branch: t.branch, commit: t.commit, summary: t.summary, status: 'pending', reason: '', ts: Date.now() };
     this.s.mergeRequests = this.s.mergeRequests.filter((m) => m.task !== t.id);
     this.s.mergeRequests.push(mr);
+    this.#report(t, a, notes);
     this.bus.log(`#${t.id} passed its check — merge request from ${who}`);
-    this.bus.notify(LEAD, `#${t.id} passed its check (${who}, branch ${t.branch ?? '?'})${t.summary ? ': ' + t.summary : ''} — review, then ask @you to approve`);
+    this.bus.notify(LEAD, `#${t.id} passed its check (${who}, branch ${t.branch ?? '?'})${t.summary ? ': ' + t.summary : ''} — review (bus report ${t.id}), then ask @you to approve`);
     this.#touch(t);
     return { ok: true, mr };
+  }
+
+  /** Build the report from the bus's own records (no agent tokens), store it, append it to reports.md. Never sent to inboxes. */
+  #report(t, a, notes) {
+    const rep = buildReport({
+      task: t, agent: a, notes,
+      claims: this.bus.claims(a.name).map((c) => c.path),
+      messages: this.s.messages,
+      isFor: (m, ag) => this.bus.isFor(m, ag),
+    });
+    t.report = { ...rep, text: render(rep) };
+    if (!this.reportsFile) return;
+    try {
+      fs.mkdirSync(path.dirname(this.reportsFile), { recursive: true });
+      fs.appendFileSync(this.reportsFile, render(rep, { md: true }) + '\n');
+    } catch (e) { this.bus.log(`couldn't append report for #${t.id}: ${e.message}`); }
+  }
+
+  /** The stored report text: lead or human only. */
+  report(who, id) {
+    if (!isBoss(who)) throw new BusError('only the lead or the human can read reports', 403);
+    const t = this.get(id);
+    if (!t.report) throw new BusError(`#${t.id} has no report yet — one is written when its done-check passes`, 404);
+    return t.report.text;
   }
 
   approve(who, id) {

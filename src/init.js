@@ -18,7 +18,7 @@ export const AGENT_RULES = `${START}
 - When a hook notice says something is waiting, run \`bus read\`. Never poll. Blocked on someone? \`bus wait\`.
 - Commit your work on your branch before bus task done.
 - Lead: Merge with plain \`git merge <sha>\` — no squash or rebase.
-- Done: \`bus task done <id> "summary"\` runs the done-check; fix failures and retry.
+- Done: \`bus task done <id> "summary"\` runs the done-check; fix failures and retry. On bus task done, include --report with up to 3 lines.
 - Keep messages short; @mention only who must act. Full text of a truncated message: \`bus show <id>\`.
 ${END}`;
 
