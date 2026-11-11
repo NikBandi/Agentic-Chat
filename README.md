@@ -66,6 +66,15 @@ bus task merged 1                       # verifies the commit is in main, releas
 Task states are `open → in_progress → review → approved → merged`, plus `dropped`. A rejection sends the task back to `in_progress`.
 
 - `bus task done` runs `git status --porcelain` in the worker's worktree first. If anything is uncommitted it refuses with `bus: commit your changes first (N files uncommitted)`, and the check doesn't run. The bus's own `.bus/` folder doesn't count. `--allow-dirty` skips this, and a worktree that isn't a git repo isn't checked at all.
+- **Reports:** `bus task done <id> --report "built X\nproblems: Y\nunfinished: Z"` takes up to 3 short lines (≤160 chars each), separated by real newlines or a literal `\n`. More is refused before the check runs. When the check passes, the bus writes the rest of the report from its own records, at no token cost to agents:
+  - agent, role and team
+  - time spent since `take`
+  - files claimed
+  - the commit
+  - check runs, failures and the final result
+  - messages sent and received during the task, grouped by counterpart (`↔ backend-1: 4 sent, 3 received; → lead: 2; ← you: 1`; system notices aren't counted)
+
+  The report is stored on the task, appended to `.bus/reports.md` next to the state file, and shown on the dashboard's merge-request card. The lead or human prints it with `bus report <id>`. Reports never go to agent inboxes; the lead's "passed its check" notice only says `review (bus report <id>)`.
 - When the check passes, the worktree's HEAD commit is stored on the merge request next to the branch. `bus task show` prints it as `commit: <sha> on <branch>`, and the dashboard shows it too.
 - `bus task merged` runs `git merge-base --is-ancestor <commit> <main>` in the lead's worktree (or in the repo `bus serve` started in). If the commit isn't in main it refuses with `bus: <sha> is not in <main> yet — merge it first with plain git merge <sha> (no squash or rebase)`. The approval notice to the lead names that same commit (`merge <sha7>`), not the branch, so commits pushed to the branch after approval can't slip in unreviewed. Squashing or rebasing creates new commits, so the reviewed one is never found in main and the check refuses. The main branch is `BUS_MAIN` if set, otherwise `main`, or `master` if `main` doesn't exist. `--force` lets the lead skip the check, and the activity log records that it did.
 
