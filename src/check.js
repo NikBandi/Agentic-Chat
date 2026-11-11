@@ -52,3 +52,37 @@ export function currentBranch(cwd) {
   return new Promise((ok) => execFile('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd, windowsHide: true },
     (err, out) => ok(err ? null : out.trim())));
 }
+
+/** Run git in cwd. Resolves {code, out, err} (out untrimmed); code -1 if git couldn't start. Never rejects. */
+export function git(args, cwd) {
+  return new Promise((ok) => execFile('git', args, { cwd, windowsHide: true }, (e, out, err) =>
+    ok({ code: e ? (typeof e.code === 'number' ? e.code : -1) : 0, out: String(out ?? ''), err: String(err ?? '').trim() })));
+}
+
+/** Number of changed/untracked files in a worktree (the bus's own .bus/ excluded), or null if not a git repo. */
+export async function uncommitted(cwd) {
+  const r = await git(['status', '--porcelain'], cwd);
+  if (r.code !== 0) return null;
+  return r.out.split('\n').filter((l) => l.trim() && !/^.. "?\.bus\//.test(l)).length;
+}
+
+/** HEAD commit SHA of a worktree, or null. */
+export async function headSha(cwd) {
+  const r = await git(['rev-parse', 'HEAD'], cwd);
+  return r.code === 0 ? r.out.trim() : null;
+}
+
+/** BUS_MAIN, else "main", else "master" if only master exists. */
+export async function mainBranch(cwd) {
+  if (process.env.BUS_MAIN) return process.env.BUS_MAIN;
+  for (const b of ['main', 'master']) if ((await git(['rev-parse', '--verify', '--quiet', `refs/heads/${b}`], cwd)).code === 0) return b;
+  return 'main';
+}
+
+/** Is commit `sha` contained in `ref`? Resolves {in: boolean} or {err: first line of git's error}. */
+export async function isAncestor(sha, ref, cwd) {
+  const r = await git(['merge-base', '--is-ancestor', sha, ref], cwd);
+  if (r.code === 0) return { in: true };
+  if (r.code === 1) return { in: false };
+  return { err: r.err.split('\n')[0] || `git exited ${r.code}` };
+}

@@ -29,12 +29,12 @@ Agents are **not** launched automatically. The human starts every session (in Or
    - **assignee**: a specific agent or a team
 3. **Workers start:** the human opens worker sessions, each with a name + team (e.g. `frontend-1` / `frontend`). On startup a worker registers and picks up the task assigned to it; a team-assigned task goes to the first free member of that team. A task whose dependencies aren't merged yet can't be taken.
 4. **Claim on take:** taking a task claims its files. Edits to files claimed by anyone else are blocked (see §5).
-5. **Done-check:** the worker runs `bus task done <id>`. The bus runs the task's done-check **in that worker's worktree**. If it fails, the task stays in progress and the worker sees the failure output (truncated). The lead does **not** re-run the check after merging.
+5. **Done-check:** the worker commits its work on its branch, then runs `bus task done <id>`. The bus refuses if the worktree has uncommitted changes (`git status --porcelain`; `--allow-dirty` overrides, and the bus's own `.bus/` is ignored). It then runs the task's done-check **in that worker's worktree** and records the worktree's HEAD commit on the merge request. If it fails, the task stays in progress and the worker sees the failure output (truncated). The lead does **not** re-run the check after merging.
 6. **Merge request:** a passing task becomes a merge request. The lead reviews it and asks the human to approve.
 7. **Human approval — two ways, both supported:**
    - **Approve / Reject** buttons on the dashboard
    - replying in chat (e.g. `@lead approve #4` / `@lead reject #4 reason`)
-8. **Merge:** after approval the lead merges the task branch. Then automatically:
+8. **Merge:** after approval the lead merges the task branch and runs `bus task merged <id>`. The bus verifies that the recorded commit is in the main branch (`git merge-base --is-ancestor`, run in the lead's worktree or the repo the server started in). The main branch is `BUS_MAIN`, defaulting to `main`, or `master` if `main` doesn't exist. If the commit isn't there, it refuses; `--force` lets the lead override. Then automatically:
    - the task's claims are released
    - owners of tasks that depended on it are mentioned: `#4 merged — rebase and start #7`
 
@@ -148,7 +148,8 @@ bus request <hot-file> "change"         ask the lead to change a hot file
 bus task add "title" --files a,b/ --check "cmd" [--after 3,4] [--for agent|team]   (lead)
 bus task list [--mine]
 bus task take <id>
-bus task done <id> ["summary"]          runs the done-check → merge request
+bus task done <id> ["summary"] [--allow-dirty]   needs committed work; runs the done-check → merge request
+bus task merged <id> [--force]          (lead) verifies the commit is in main, then releases claims
 bus task reassign <id> <agent>          (lead/human)
 bus approve <id> | bus reject <id> "why" (human, also via dashboard)
 ```

@@ -197,7 +197,8 @@ function renderMR() {
     let why;
     return h('div', { class: 'card' },
       h('div', { class: 'row' }, h('strong', {}, '#' + t.id + ' ' + t.title), h('span', { class: 'tag' }, mr.agent || t.owner || '?'),
-        h('span', { class: 'tag' }, mr.branch || t.branch || 'no branch'), h('span', { class: 'mute' }, ago(mr.ts || t.updatedAt))),
+        h('span', { class: 'tag' }, mr.branch || t.branch || 'no branch'),
+        (mr.commit || t.commit) ? h('span', { class: 'tag', title: mr.commit || t.commit }, (mr.commit || t.commit).slice(0, 7)) : null, h('span', { class: 'mute' }, ago(mr.ts || t.updatedAt))),
       (mr.summary || t.summary) ? h('div', {}, mr.summary || t.summary) : null,
       h('div', {}, checkBadge(t)), outPre(t),
       rej ? h('form', { class: 'row', onsubmit: (e) => { e.preventDefault(); rejecting.delete(t.id); api('/api/reject', { id: t.id, why: why.value }); } },
@@ -225,7 +226,7 @@ function taskCard(t) {
     open ? h('div', {}, t.brief ? h('div', { class: 'msg' }, t.brief) : null,
       t.files?.length ? h('div', { class: 'mute' }, 'files: ' + t.files.join(', ')) : null,
       t.check ? h('div', { class: 'mute' }, 'check: ' + t.check) : null,
-      t.branch ? h('div', { class: 'mute' }, 'branch: ' + t.branch) : null,
+      t.branch ? h('div', { class: 'mute' }, 'branch: ' + t.branch + (t.commit ? ' @ ' + t.commit.slice(0, 7) : '')) : null,
       t.summary ? h('div', {}, t.summary) : null) : null,
     live ? (reassigning.has(t.id)
       ? h('form', { class: 'row', onsubmit: (e) => { e.preventDefault(); reassigning.delete(t.id); api('/api/task/reassign', { id: t.id, to: sel.value }); } },

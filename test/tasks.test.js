@@ -520,9 +520,9 @@ function cli(port, { agent: who, team, cwd }, args) {
 describe('end to end (HTTP server + bus CLI)', () => {
   let srv, port, repo, hasGit = true;
   before(async () => {
-    srv = createServer({ port: 0 });
-    port = await srv.listen();
     repo = path.join(tmp, 'repo');
+    srv = createServer({ port: 0, repoDir: repo });
+    port = await srv.listen();
     fs.mkdirSync(repo);
     try { git(repo, 'init'); git(repo, 'commit', '--allow-empty', '-m', 'init'); }
     catch { hasGit = false; fs.mkdirSync(path.join(repo, '.git'), { recursive: true }); }
@@ -530,7 +530,7 @@ describe('end to end (HTTP server + bus CLI)', () => {
   after(() => srv.close());
 
   test('add -> take -> done (fail, then pass) -> approve -> merged', async () => {
-    const lead = { agent: 'lead' }, worker = { agent: 'alice', team: 'fe', cwd: repo }, human = {};
+    const lead = { agent: 'lead', cwd: repo }, worker = { agent: 'alice', team: 'fe', cwd: repo }, human = {};
     let r = await cli(port, worker, ['join']);
     assert.equal(r.code, 0, r.err);
     const norm = (p) => fs.realpathSync.native(p).split(path.sep).join('/').toLowerCase();
@@ -556,10 +556,20 @@ describe('end to end (HTTP server + bus CLI)', () => {
     assert.equal(srv.tasks.get(1).status, 'in_progress');
 
     fs.writeFileSync(path.join(repo, 'ok.txt'), 'x');
+    if (hasGit) {
+      r = await cli(port, worker, ['task', 'done', '1', 'built', 'it']);
+      assert.equal(r.err, 'bus: commit your changes first (1 file uncommitted)');
+      git(repo, 'add', 'ok.txt'); git(repo, 'commit', '-m', 'ok');
+    }
     r = await cli(port, worker, ['task', 'done', '1', 'built', 'it']);
     assert.match(r.out, /check passed/);
     assert.equal(srv.tasks.get(1).status, 'review');
-    if (hasGit) assert.ok(srv.tasks.get(1).branch, 'branch recorded');
+    if (hasGit) {
+      assert.ok(srv.tasks.get(1).branch, 'branch recorded');
+      assert.match(srv.tasks.get(1).commit, /^[0-9a-f]{40}$/);
+      r = await cli(port, worker, ['task', 'show', '1']);
+      assert.match(r.out, new RegExp(`^commit: ${srv.tasks.get(1).commit.slice(0, 7)} on `, 'm'));
+    }
     assert.equal(srv.tasks.get(1).summary, 'built it');
 
     // agents cannot approve; lead cannot mark merged before approval

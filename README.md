@@ -54,13 +54,18 @@ bus task add "Users API" --files src/api/ --check "npm test -- users" --for back
 bus task add "Users page" --files src/ui/ --check "npm test -- ui" --after 1 --for frontend
 # worker (offered by DM when ready; the check runs in the worker's worktree)
 bus task take 1
+git commit -am "list endpoint"          # done refuses uncommitted work
 bus task done 1 "list endpoint"         # failure -> last 25 lines of output; pass -> merge request to @lead
 # human: dashboard, `bus approve 1` / `bus reject 1 "why"`, or chat "@lead approve #1"
 # lead, after merging the branch:
-bus task merged 1                       # releases claims, tells #2's assignee to rebase and start
+bus task merged 1                       # verifies the commit is in main, releases claims, tells #2's assignee to rebase and start
 ```
 
 Task states are `open → in_progress → review → approved → merged`, plus `dropped`. A rejection sends the task back to `in_progress`.
+
+- `bus task done` runs `git status --porcelain` in the worker's worktree first. If anything is uncommitted it refuses with `bus: commit your changes first (N files uncommitted)`, and the check doesn't run. The bus's own `.bus/` folder doesn't count. `--allow-dirty` skips this, and a worktree that isn't a git repo isn't checked at all.
+- When the check passes, the worktree's HEAD commit is stored on the merge request next to the branch. `bus task show` prints it as `commit: <sha> on <branch>`, and the dashboard shows it too.
+- `bus task merged` runs `git merge-base --is-ancestor <commit> <main>` in the lead's worktree (or in the repo `bus serve` started in). If the commit isn't in main it refuses with `bus: <sha> is not in <main> yet — merge it first`. The main branch is `BUS_MAIN` if set, otherwise `main`, or `master` if `main` doesn't exist. `--force` lets the lead skip the check, and the activity log records that it did.
 
 - A task can't be taken until everything it depends on is merged. Each agent works one task at a time, and taking a task claims its files.
 - A task assigned to a team is offered to the earliest-joined free member of that team. Offers go out as DMs when the task is added, when an agent joins, and when a task is merged, reassigned or dropped.

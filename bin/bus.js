@@ -29,8 +29,8 @@ const HELP = `bus — local agent chat, claims and tasks
   bus task add "title" --files a,b/ --check "cmd" [--after 3,4] [--for agent|team]
                [--brief "text" | --brief-file f] [--timeout secs]          (lead)
   bus task list [--mine] | show <id> | take <id>
-  bus task done <id> ["summary"]        run the done-check -> merge request
-  bus task merged <id>                  (lead) after merging the approved branch
+  bus task done <id> ["summary"] [--allow-dirty]  commit first; runs the done-check -> merge request
+  bus task merged <id> [--force]        (lead) after merging; verifies the commit is in main
   bus task reassign <id> <agent> | drop <id>                    (lead/human)
   bus approve <id> | bus reject <id> "why"                      (human)`;
 
@@ -224,6 +224,7 @@ function taskDetail(t) {
     taskLine(t),
     `files: ${t.files.join(' ') || '-'}`,
     `check: ${t.check}`,
+    t.commit && `commit: ${t.commit.slice(0, 7)} on ${t.branch ?? '?'}`,
     t.brief && `\n${t.brief}`,
   ].filter(Boolean).join('\n');
 }
@@ -259,15 +260,18 @@ const taskCommands = {
     console.log(`took ${taskDetail(t)}`);
   },
 
-  async done([id, ...summary]) {
-    const r = await request('POST', '/api/task/done', { body: { id, summary: summary.join(' ') }, headers: { 'x-bus-cwd': gitRoot() } });
+  async done(args) {
+    const allowDirty = takeFlag(args, '--allow-dirty');
+    const [id, ...summary] = args;
+    const r = await request('POST', '/api/task/done', { body: { id, summary: summary.join(' '), allowDirty }, headers: { 'x-bus-cwd': gitRoot() } });
     if (r.ok) return console.log(`check passed — #${r.mr.task} sent to @lead for review`);
     console.log(`check failed (exit ${r.code}) — fix and rerun bus task done ${id}\n${r.output}`);
     process.exitCode = 1;
   },
 
-  async merged([id]) {
-    const { task: t } = await request('POST', '/api/task/merged', { body: { id } });
+  async merged(args) {
+    const force = takeFlag(args, '--force');
+    const { task: t } = await request('POST', '/api/task/merged', { body: { id: args[0], force } });
     console.log(`#${t.id} merged — claims released, dependents notified`);
   },
 

@@ -14,10 +14,11 @@ const MAX_WAIT_S = 3600;
 export function createServer({
   dataFile = null, port = DEFAULT_PORT, host = '127.0.0.1',
   inactiveMs = (Number(process.env.BUS_INACTIVE_MIN) || 30) * 60_000,
+  repoDir = process.cwd(), // merges are verified here when the lead's worktree is unknown
 } = {}) {
   const store = new Store(dataFile);
   const bus = new Bus(store);
-  const tasks = new Tasks(bus);
+  const tasks = new Tasks(bus, { repo: repoDir });
   const waiters = new Map(); // agent -> Set<fn>
 
   // Dashboard live updates (SSE). Any state change -> one debounced "change" event; clients refetch /api/state.
@@ -68,8 +69,8 @@ export function createServer({
     'GET /api/task/list': ({ who, q }) => ({ tasks: tasks.list(who, !!q.get('mine')) }),
     'GET /api/task/show': ({ q }) => ({ task: tasks.get(q.get('id')) }),
     'POST /api/task/take': ({ who, body }) => ({ task: tasks.take(need(who), body.id) }),
-    'POST /api/task/done': ({ who, body }) => tasks.done(need(who), body.id, body.summary),
-    'POST /api/task/merged': ({ who, body }) => ({ task: tasks.merged(who, body.id) }),
+    'POST /api/task/done': ({ who, body }) => tasks.done(need(who), body.id, body.summary, { allowDirty: !!body.allowDirty }),
+    'POST /api/task/merged': async ({ who, body }) => ({ task: await tasks.merged(who, body.id, { force: !!body.force }) }),
     'POST /api/task/reassign': ({ who, body }) => ({ task: tasks.reassign(who, body.id, body.to) }),
     'POST /api/task/drop': ({ who, body }) => ({ task: tasks.drop(who, body.id) }),
     'POST /api/approve': ({ who, body }) => ({ task: tasks.approve(who, body.id) }),
