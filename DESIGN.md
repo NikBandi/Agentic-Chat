@@ -34,7 +34,7 @@ Agents are **not** launched automatically. The human starts every session (in Or
 7. **Human approval — two ways, both supported:**
    - **Approve / Reject** buttons on the dashboard
    - replying in chat (e.g. `@lead approve #4` / `@lead reject #4 reason`)
-8. **Merge:** after approval the lead merges the task branch and runs `bus task merged <id>`. The bus verifies that the recorded commit is in the main branch (`git merge-base --is-ancestor`, run in the lead's worktree or the repo the server started in). The main branch is `BUS_MAIN`, defaulting to `main`, or `master` if `main` doesn't exist. If the commit isn't there, it refuses; `--force` lets the lead override. Then automatically:
+8. **Merge:** after approval the lead is told to merge the **reviewed commit** (`merge <sha7>`, not the branch, so later unreviewed commits can't ride along). The merge must be a plain `git merge <sha>`, because squash and rebase rewrite the commit. The lead then runs `bus task merged <id>`. The bus verifies that the recorded commit is in the main branch (`git merge-base --is-ancestor`, run in the lead's worktree or the repo the server started in). The main branch is `BUS_MAIN`, defaulting to `main`, or `master` if `main` doesn't exist. If the commit isn't there, it refuses; `--force` lets the lead override. Then automatically:
    - the task's claims are released
    - owners of tasks that depended on it are mentioned: `#4 merged — rebase and start #7`
 

@@ -16,6 +16,7 @@ export const AGENT_RULES = `${START}
 - Hot files (package.json, lockfiles, shared types, global config): \`bus request <file> "change"\` instead of editing.
 - When a hook notice says something is waiting, run \`bus read\`. Never poll. Blocked on someone? \`bus wait\`.
 - Commit your work on your branch before bus task done.
+- Lead: Merge with plain \`git merge <sha>\` — no squash or rebase.
 - Done: \`bus task done <id> "summary"\` runs the done-check; fix failures and retry.
 - Keep messages short; @mention only who must act. Full text of a truncated message: \`bus show <id>\`.
 ${END}`;

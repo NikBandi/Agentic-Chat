@@ -140,7 +140,9 @@ describe('task merged verifies the commit is in main', { skip }, () => {
 
   test('refuses until the branch is merged into main, then completes', async () => {
     const { main, tasks, t, sha, bus } = await approved();
-    await assert.rejects(tasks.merged('lead', t.id), { message: `${sha.slice(0, 7)} is not in main yet — merge it first`, status: 409 });
+    const s7 = sha.slice(0, 7);
+    await assert.rejects(tasks.merged('lead', t.id),
+      { message: `${s7} is not in main yet — merge it first with plain git merge ${s7} (no squash or rebase)`, status: 409 });
     assert.equal(tasks.get(t.id).status, 'approved');
     assert.equal(bus.s.agents.fe1.task, t.id);
     g(main, 'merge', '-q', '--no-ff', '-m', 'merge feat', 'feat');
@@ -149,7 +151,25 @@ describe('task merged verifies the commit is in main', { skip }, () => {
   });
   test('falls back to master when main does not exist', async () => {
     const { tasks, t, sha } = await approved('master');
-    await assert.rejects(tasks.merged('lead', t.id), { message: `${sha.slice(0, 7)} is not in master yet — merge it first` });
+    await assert.rejects(tasks.merged('lead', t.id), { message: new RegExp(`^${sha.slice(0, 7)} is not in master yet — merge it first`) });
+  });
+  test('approval notice names the reviewed commit, not the branch', async () => {
+    const { bus, t, sha } = await approved();
+    const note = bus.s.messages.filter((m) => m.to === 'lead').at(-1).text;
+    assert.equal(note, `#${t.id} approved — merge ${sha.slice(0, 7)} (git merge ${sha.slice(0, 7)}; not the branch), then: bus task merged ${t.id}`);
+    assert.ok(!note.includes('feat'));
+  });
+  test('merging the reviewed sha passes even if the branch moved on after approval', async () => {
+    const { main, wt, tasks, t, sha } = await approved();
+    const late = commit(wt, 'late.txt'); // unreviewed commit added after approval
+    g(main, 'merge', '-q', '--no-ff', '-m', 'm', sha.slice(0, 7));
+    assert.equal((await tasks.merged('lead', t.id)).status, 'merged');
+    assert.throws(() => g(main, 'merge-base', '--is-ancestor', late, 'main')); // the late commit stayed out of main
+  });
+  test('a squash merge is refused: the reviewed commit is not an ancestor of main', async () => {
+    const { main, tasks, t } = await approved();
+    g(main, 'merge', '-q', '--squash', 'feat'); g(main, 'commit', '-q', '-m', 'squashed');
+    await assert.rejects(tasks.merged('lead', t.id), { message: /no squash or rebase/ });
   });
   test('BUS_MAIN names the main branch', async () => {
     const { main, tasks, t } = await approved();

@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { mergeSettings, mergeClaudeMd, init } from '../src/init.js';
+import { mergeSettings, mergeClaudeMd, init, AGENT_RULES } from '../src/init.js';
 import { createServer } from '../src/server.js';
 
 const BIN = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'bin', 'bus.js');
@@ -29,6 +29,12 @@ describe('bus init', () => {
     const stale = '# P\n<!-- agent-bus -->\nold\n<!-- /agent-bus -->\ntail\n';
     const fresh = mergeClaudeMd(stale);
     assert.ok(!fresh.includes('\nold\n') && fresh.endsWith('tail\n'));
+  });
+
+  test('agent rules: commit before done, lead merges the sha plainly, block stays ~10 lines', () => {
+    assert.match(AGENT_RULES, /^- Commit your work on your branch before bus task done\.$/m);
+    assert.match(AGENT_RULES, /^- Lead: Merge with plain `git merge <sha>` — no squash or rebase\.$/m);
+    assert.ok(AGENT_RULES.split('\n').length <= 12, 'rules block (incl. markers) must stay short');
   });
 
   test('init writes files and refuses invalid settings JSON', () => {

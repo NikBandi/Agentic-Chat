@@ -166,7 +166,9 @@ export class Tasks {
     t.status = 'approved';
     Object.assign(this.#mr(t), { status: 'approved' });
     this.bus.log(`#${t.id} approved`);
-    this.bus.notify(LEAD, `#${t.id} approved — merge ${t.branch ?? 'its branch'}, then: bus task merged ${t.id}`);
+    // Name the reviewed commit, not the branch: commits added to the branch after approval must not ride along.
+    const what = t.commit ? `${short(t.commit)} (git merge ${short(t.commit)}; not the branch)` : (t.branch ?? 'its branch');
+    this.bus.notify(LEAD, `#${t.id} approved — merge ${what}, then: bus task merged ${t.id}`);
     this.#touch(t);
     return t;
   }
@@ -207,7 +209,7 @@ export class Tasks {
     const r = await isAncestor(t.commit, main, dir);
     if (t.status !== 'approved') throw new BusError(`#${t.id} changed while verifying (${t.status})`, 409);
     if (r.err) throw new BusError(`can't verify ${short(t.commit)} in ${main}: ${r.err} — merge it, or use --force`, 409);
-    if (!r.in) throw new BusError(`${short(t.commit)} is not in ${main} yet — merge it first`, 409);
+    if (!r.in) throw new BusError(`${short(t.commit)} is not in ${main} yet — merge it first with plain git merge ${short(t.commit)} (no squash or rebase)`, 409);
     return this.#finishMerge(t);
   }
 
