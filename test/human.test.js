@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { createServer } from '../src/server.js';
 import { bashBlockReason } from '../src/hooks.js';
 import { mergeSettings, DENY } from '../src/init.js';
-import { writeHumanToken, readHumanToken, removeHumanToken } from '../src/human.js';
+import { writeHumanToken, readHumanToken, removeHumanToken, openCommand } from '../src/human.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const BIN = path.join(HERE, '..', 'bin', 'bus.js');
@@ -115,7 +115,30 @@ describe('bus serve writes the human token outside the repo and prints the dashb
       const denied = await run(['auth', 'reset', 'nobody'], { env: { BUS_URL: url, AGENTIC_CHAT_HOME: fresh('elsewhere') } });
       assert.equal(denied.code, 1);
       assert.match(denied.stderr, /^bus: human token required/);
+
+      // bus dashboard: the human gets the current tokened link
+      const dash = await run(['dashboard', '--no-open'], { env: { BUS_URL: url, AGENTIC_CHAT_HOME: home } });
+      assert.equal(dash.code, 0, dash.stderr);
+      assert.equal(dash.stdout, `${url}/#t=${token}`);
+      const asAgent = await run(['dashboard', '--no-open'], { env: { BUS_URL: url, AGENTIC_CHAT_HOME: home, BUS_AGENT: 'bob', BUS_TEAM: 'be' } });
+      assert.equal(asAgent.code, 1);
+      assert.equal(asAgent.stderr, 'bus: bus dashboard is for the human — run it without BUS_AGENT');
+      assert.equal(asAgent.stdout, '', 'no token printed for agents');
+      const noFile = await run(['dashboard', '--no-open'], { env: { BUS_URL: url, AGENTIC_CHAT_HOME: fresh('empty') } });
+      assert.equal(noFile.code, 1);
+      assert.match(noFile.stderr, /^bus: no human token for port \d+ — start the server with bus serve/);
+      const stale = fresh('stale');
+      fs.writeFileSync(path.join(stale, `${port}.human.token`), 'old-token\n');
+      const old = await run(['dashboard', '--no-open'], { env: { BUS_URL: url, AGENTIC_CHAT_HOME: stale } });
+      assert.equal(old.code, 1, 'a token from an older bus serve is caught, not printed');
+      assert.equal(old.stdout, '');
     } finally { serve.kill(); }
+  });
+  test('openCommand: the default browser per platform, fragment intact', () => {
+    const u = 'http://127.0.0.1:4477/#t=abc';
+    assert.deepEqual(openCommand(u, 'win32'), ['rundll32', ['url.dll,FileProtocolHandler', u]]);
+    assert.deepEqual(openCommand(u, 'darwin'), ['open', [u]]);
+    assert.deepEqual(openCommand(u, 'linux'), ['xdg-open', [u]]);
   });
   test('removeHumanToken only deletes a file that still holds our token', () => {
     const home = fresh('home');
@@ -146,7 +169,7 @@ describe('dashboard carries the human token', () => {
 describe('shell guard (PreToolUse on Bash|PowerShell)', () => {
   const blocked = [
     'bus approve 3', 'cd repo && bus reject 2 "nope"', 'node bin/bus.js approve 1', 'node "C:/x/bus.js" auth reset bob',
-    'bus auth reset alice', 'curl -X POST http://127.0.0.1:4477/api/approve -d \'{"id":1}\'',
+    'bus auth reset alice', 'bus dashboard', 'bus dashboard --no-open', 'curl -X POST http://127.0.0.1:4477/api/approve -d \'{"id":1}\'',
     'unset BUS_AGENT', 'unset FOO BUS_AGENT', 'BUS_AGENT=lead bus task merged 1', 'export BUS_AGENT=lead',
     'env -u BUS_AGENT bus send hi', 'env -i sh -c "bus approve 1"', 'env --ignore-environment node x',
     '$env:BUS_AGENT = "lead"', 'Remove-Item env:BUS_AGENT', 'set BUS_AGENT=lead',
@@ -165,7 +188,7 @@ describe('shell guard (PreToolUse on Bash|PowerShell)', () => {
     const agent = { BUS_AGENT: 'bob', BUS_TEAM: 'be' };
     const r = await run(['hook', 'bash'], { env: agent, input: input('bus approve 4') });
     assert.equal(r.code, 2);
-    assert.equal(r.stderr, "bus: blocked — this command approve/reject/auth are human-only bus commands. Agents can't act as the human; ask @you.");
+    assert.equal(r.stderr, "bus: blocked — this command approve/reject/auth/dashboard are human-only bus commands. Agents can't act as the human; ask @you.");
     assert.equal(r.stderr.split('\n').length, 1);
     const ps = await run(['hook', 'bash'], { env: agent, input: JSON.stringify({ tool_name: 'PowerShell', tool_input: { command: '$env:BUS_AGENT="lead"' } }) });
     assert.equal(ps.code, 2);

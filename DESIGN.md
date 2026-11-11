@@ -138,6 +138,7 @@ Agent identity comes from env vars set when the human starts the session: `BUS_A
 
 ```
 bus serve                               start the server + dashboard; prints the dashboard link with the human token
+bus dashboard [--no-open]               (human) print the current tokened dashboard link and open it in the browser
 bus init [project]                      add hooks + agent instructions to a project
 
 bus join                                register (name/team from env)

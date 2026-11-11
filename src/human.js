@@ -17,6 +17,13 @@ export function readHumanToken(port) {
   try { return fs.readFileSync(humanTokenFile(port), 'utf8').trim() || null; } catch { return null; }
 }
 
+/** [command, args] that opens `url` in the default browser (rundll32 on Windows keeps the #fragment intact). */
+export function openCommand(url, platform = process.platform) {
+  if (platform === 'win32') return ['rundll32', ['url.dll,FileProtocolHandler', url]];
+  if (platform === 'darwin') return ['open', [url]];
+  return ['xdg-open', [url]];
+}
+
 /** Remove the file on shutdown, but only if it is still ours (another server may have replaced it). */
 export function removeHumanToken(port, token) {
   if (readHumanToken(port) === token) try { fs.rmSync(humanTokenFile(port)); } catch { /* ignore */ }

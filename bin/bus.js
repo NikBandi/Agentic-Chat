@@ -2,8 +2,9 @@
 // `bus` CLI. Output is deliberately terse: one line per item, no decoration (agents pay for every token).
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { request, tokenFile } from '../src/client.js';
-import { writeHumanToken, removeHumanToken } from '../src/human.js';
+import { spawn } from 'node:child_process';
+import { request, tokenFile, baseUrl } from '../src/client.js';
+import { writeHumanToken, removeHumanToken, readHumanToken, humanTokenFile, openCommand } from '../src/human.js';
 import { createServer, DEFAULT_PORT } from '../src/server.js';
 
 const TRUNC = 200;
@@ -34,7 +35,8 @@ const HELP = `bus — local agent chat, claims and tasks
   bus task merged <id> [--force]        (lead) after merging; verifies the commit is in main
   bus task reassign <id> <agent> | drop <id>                    (lead/human)
   bus approve <id> | bus reject <id> "why"                      (human)
-  bus auth reset <agent>                drop an agent's token (BUS_AUTH=1)  (human)`;
+  bus auth reset <agent>                drop an agent's token (BUS_AUTH=1)  (human)
+  bus dashboard [--no-open]             print + open the dashboard link with your token  (human)`;
 
 function fmt(m) {
   let t = m.text.replace(/\s*\n\s*/g, ' ⏎ ');
@@ -219,6 +221,25 @@ const commands = {
     const fn = { pre: hooks.preEdit, post: hooks.postTool, bash: hooks.preBash, commit: () => hooks.preCommit() }[sub];
     if (!fn) throw new Error(`unknown hook "${sub}"`);
     process.exit(await fn());
+  },
+
+  async dashboard(args) {
+    if (process.env.BUS_AGENT) throw new Error('bus dashboard is for the human — run it without BUS_AGENT');
+    const noOpen = takeFlag(args, '--no-open');
+    const base = new URL(baseUrl());
+    const port = base.port || '80';
+    const token = readHumanToken(port);
+    if (!token) throw new Error(`no human token for port ${port} — start the server with bus serve (it writes ${humanTokenFile(port)})`);
+    await request('GET', '/api/who'); // server up? token current? (401 under BUS_AUTH if it's from an older bus serve)
+    const url = `${base.origin}/#t=${token}`;
+    console.log(url);
+    if (noOpen) return;
+    const [cmd, cmdArgs] = openCommand(url);
+    try {
+      const p = spawn(cmd, cmdArgs, { detached: true, stdio: 'ignore', windowsHide: true });
+      p.on('error', () => console.error('bus: could not open a browser — open the link above'));
+      p.unref();
+    } catch { console.error('bus: could not open a browser — open the link above'); }
   },
 
   async auth([sub, agent]) {

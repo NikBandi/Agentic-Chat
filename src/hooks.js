@@ -101,7 +101,7 @@ export async function preEdit() {
 // ---- shell guard: agents can't act as the human or shed their identity ------------------------------
 
 const SHELL_RULES = [
-  [/\bbus(?:\.js)?["']?\s+(?:approve|reject|auth)\b/i, 'approve/reject/auth are human-only bus commands'],
+  [/\bbus(?:\.js)?["']?\s+(?:approve|reject|auth|dashboard)\b/i, 'approve/reject/auth/dashboard are human-only bus commands'],
   [/\/api\/(?:approve|reject|auth)\b/i, 'calls a human-only bus endpoint'],
   [/\bunset\b[^;&|\n]*\bBUS_AGENT\b/, 'unsets BUS_AGENT'],
   [/(?<![$\w])BUS_AGENT\s*=(?!=)/, 'overrides BUS_AGENT'], // BUS_AGENT=x cmd, export BUS_AGENT=, $env:BUS_AGENT = , set BUS_AGENT=
