@@ -84,7 +84,21 @@ Task states are `open → in_progress → review → approved → merged`, plus 
 
 ## Dashboard
 
-Open http://127.0.0.1:4477/ while `bus serve` is running. It shows merge requests with Approve and Reject buttons, the task board (reassign or drop), agents (inactive after 30 minutes), claims, hot files, interfaces and open requests, channels and DMs with a composer that posts as you, and the activity log. Updates arrive live over Server-Sent Events.
+Run `bus dashboard` (or open the link `bus serve` prints). It's one self-contained page with no dependencies, built to be calm enough to leave open all day. Color only means something. Persimmon appears only when you need to act; otherwise the page is nearly colorless. Status is always shown as a label as well as a color.
+
+- **Top bar:** a connection dot, a theme toggle (auto / light / dark, remembered), and a "N need you" pill when something is waiting. The tab title shows `(N) Agentic Chat`.
+- **Needs you:** merge requests show the agent, branch, short SHA, check result (output behind a click), summary and report. Approve, or Reject with an inline reason field. Unread messages to you appear here too. When nothing is waiting: "Nothing needs you. Breathe."
+- **Tasks:** columns Open → In progress → Review → Approved → Merged, with merged and dropped tasks collapsed. Dependency chips stay dimmed until merged. Click a card for its brief, files, done-check, last output, report, Reassign, and Drop (with an inline confirm).
+- **Agents:** tabs Active · Waiting · Done · Inactive, remembered.
+  - Each card shows role, team, task, a 5-step progress line (taken → checking → review → approved → merged), time on task, last seen, last check, and last message.
+  - Done shows each agent's report.
+  - Inactive dims the card and hides Reassign and Release claims behind a click.
+  - Click a card for the agent's full history: tasks, reports, commits, check runs, and who it talked with.
+- **Messages:** channels and DMs with unread counts (system notices don't count). Mentions of you get a persimmon edge. The composer has `@`/`#` autocomplete, and Enter sends.
+- **Claims** are grouped by agent, with hot files, interfaces and requests below. The activity log sits in a collapsed **Quiet log**.
+- **Responsive** to one column below 1000px. Keyboard throughout: Esc closes panels, arrow keys switch tabs, and focus is visible. Respects reduced motion. Text contrast is WCAG AA in both themes.
+
+"Waiting" covers idle agents and agents blocked in `bus wait`. The server doesn't publish who is inside `bus wait`, so the dashboard can't tell those two apart.
 
 ## Hot files, interfaces, inactivity
 

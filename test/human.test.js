@@ -162,7 +162,22 @@ describe('dashboard carries the human token', () => {
     assert.match(html, /fetch\(path, \{[^}]*\.\.\.HUMAN_HDR/);
     assert.match(html, /fetch\('\/api\/state', \{ headers: HUMAN_HDR \}\)/);
     assert.match(html, /new EventSource\('\/api\/events' \+ \(HUMAN_TOKEN \? '\?t=' \+ encodeURIComponent\(HUMAN_TOKEN\)/);
-    assert.ok(!/localStorage/.test(html), 'never persisted beyond the tab');
+    // the token never leaves sessionStorage; localStorage only holds view preferences
+    assert.ok(!/localStorage[^\n]*(?:busHumanToken|HUMAN_TOKEN)/.test(html), 'token never persisted beyond the tab');
+    const kept = [...html.matchAll(/store\.set\('(\w+)'/g)].map((m) => m[1]).sort();
+    assert.deepEqual([...new Set(kept)], ['busAgentTab', 'busChannel', 'busLastRead', 'busTheme']);
+  });
+  test('zen redesign keeps every action and the a11y hooks', () => {
+    for (const route of ['/api/approve', '/api/reject', '/api/task/reassign', '/api/task/drop', '/api/send', '/api/release']) assert.ok(html.includes(`'${route}'`), route);
+    assert.ok(!/\bconfirm\(|\bprompt\(|\balert\(/.test(html), 'no browser dialogs: inline confirm/reason fields');
+    assert.match(html, /:focus-visible\{outline:2px solid var\(--indigo\)/);
+    assert.match(html, /prefers-reduced-motion:reduce/);
+    assert.match(html, /id="needs"[^>]*aria-live="polite"/);
+    assert.match(html, /id="feed"[^>]*aria-live="polite"/);
+    assert.match(html, /role="dialog"/);
+    assert.match(html, /Nothing needs you\. Breathe\./);
+    assert.match(html, /No agents yet — start one with BUS_AGENT=name claude/);
+    assert.ok(!/gradient\(|<link(?![^>]*href="data:)|<script src|@import|https?:\/\/(?!127)/.test(html), 'self-contained: no gradients, CDNs or external fonts');
   });
 });
 
