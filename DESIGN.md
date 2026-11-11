@@ -86,9 +86,15 @@ These are requirements, not nice-to-haves.
   - Claimed by someone else → block (exit code 2) with a short message telling the agent who owns it and how to ask them.
   - Free → allow. (Optionally auto-claim on first edit.)
   - Bus not running or `BUS_AGENT` unset → allow silently (never get in the way).
-- **Shell writes:** the hook above only sees Claude Code's edit tools. A **git pre-commit hook**, installed by `bus init`, closes the gap at commit time. It checks every staged file and blocks the commit if a file is claimed by another agent, or is a hot file and the committer isn't the lead. It allows the commit when `BUS_AGENT` is unset, when the bus is down, or when concluding a merge. Any existing hook is kept as `pre-commit.pre-bus` and run first. Shell writes can still change the working tree, but they can't be committed.
+- **Shell writes:** the hook above only sees Claude Code's edit tools. A **git pre-commit hook**, installed by `bus init`, closes the gap at commit time. It checks every staged file and blocks the commit if a file is claimed by another agent, or is a hot file and the committer isn't the lead. It allows the commit when `BUS_AGENT` is unset (the human), when the bus is down, or when the lead concludes a merge. Workers' merge commits are checked like any other. Any existing hook is kept as `pre-commit.pre-bus` and run first. Shell writes can still change the working tree, but they can't be committed.
 - **Bus down is visible:** when a hook can't reach the bus while `BUS_AGENT` is set, it allows the action and prints `bus: server unreachable — edits are NOT being guarded` once. A marker in the temp dir, keyed on agent and port, keeps it to once and is cleared when the bus answers again.
-- **Optional identity proof (`BUS_AUTH=1`, off by default):** `bus join` issues a per-agent token, stored in `<worktree>/.bus/agents/<name>.token` (git-ignored). The server stores only its hash and requires the token on every later request from that agent. `bus auth reset <agent>` (human) recovers a lost one. The human is still the identity-less caller.
+- **Optional identity proof (`BUS_AUTH=1`, off by default):** `bus join` issues a per-agent token, stored in `<worktree>/.bus/agents/<name>.token` (git-ignored). The server stores only its hash and requires the token on every later request from that agent. `bus auth reset <agent>` (human) recovers a lost one.
+- **Human lock:**
+  - `bus serve` writes a fresh human token to `~/.agentic-chat/<port>.human.token`, outside every repo, and prints `http://127.0.0.1:<port>/#t=<token>`.
+  - The dashboard keeps it in `sessionStorage` and sends it on every request. EventSource can't set headers, so the SSE stream takes it as `?t=`. Human CLI commands read the file.
+  - With `BUS_AUTH=1`, identity-less requests (or the name `you`) without it get 401.
+  - `bus init` adds a PreToolUse hook on `Bash|PowerShell` for agent sessions. It blocks `bus approve|reject|auth`, those API endpoints, any unsetting or overriding of `BUS_AGENT`, and access to `~/.agentic-chat`, each with a one-line reason. It also adds deny rules for `Read`/`Edit(~/.agentic-chat/**)`.
+- **Threat model, honestly:** all of the above guards against agents' mistakes and casual misuse, not against a malicious process running as the same OS user. Such a process can read the token directory with tools the hooks don't see, edit settings or git hooks, or call the 127.0.0.1 API directly. Shell pattern matching is best-effort. Real isolation needs a separate OS user or a container.
 
 ### Hot files — one owner
 Shared files everyone needs (`package.json`, lockfiles, shared types, global config, route registries) are **owned by the lead**. Workers request changes instead of editing:
@@ -131,7 +137,7 @@ Local web page served by the bus:
 Agent identity comes from env vars set when the human starts the session: `BUS_AGENT` (name) and `BUS_TEAM` (team).
 
 ```
-bus serve                               start the server + dashboard
+bus serve                               start the server + dashboard; prints the dashboard link with the human token
 bus init [project]                      add hooks + agent instructions to a project
 
 bus join                                register (name/team from env)

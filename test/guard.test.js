@@ -119,16 +119,21 @@ describe('pre-commit claim guard (real git commits)', { skip }, () => {
     assert.match(c.stderr, /^bus: commit blocked — package\.json is a hot file owned by lead; unstage it and ask: bus request package\.json/);
     assert.equal((await commit(r, as('lead', 'lead'))).code, 0);
   });
-  test('allowed: free files, no BUS_AGENT (the human), concluding a merge', async () => {
+  test('allowed: free files and no BUS_AGENT (the human)', async () => {
     stage('docs/free.md');
     assert.equal((await commit(r, as('bob', 'be'))).code, 0);
     stage('src/api/human.js');
     assert.equal((await commit(r, { BUS_URL: url })).code, 0);
+  });
+  test('merge-commit exemption is for the lead only: a worker cannot sneak claimed files into a merge', async () => {
     stage('src/api/merge.js');
     fs.writeFileSync(path.join(r, '.git', 'MERGE_HEAD'), g(r, 'rev-parse', 'HEAD') + '\n');
     try {
-      const h = await bus(['hook', 'commit'], { cwd: r, env: as('bob', 'be') });
-      assert.equal(h.code, 0, h.stderr);
+      const worker = await bus(['hook', 'commit'], { cwd: r, env: as('bob', 'be') });
+      assert.equal(worker.code, 1);
+      assert.match(worker.stderr, /^bus: commit blocked — src\/api\/merge\.js is claimed by alice/);
+      const lead = await bus(['hook', 'commit'], { cwd: r, env: as('lead', 'lead') });
+      assert.equal(lead.code, 0, lead.stderr);
     } finally { fs.rmSync(path.join(r, '.git', 'MERGE_HEAD')); reset(); }
   });
   test('bus down: commit allowed, warning printed once', async () => {
@@ -192,10 +197,11 @@ describe('BUS_AUTH per-agent tokens', () => {
     plainPort = await plain.listen();
   });
   after(async () => { await srv.close(); await plain.close(); });
-  async function api(method, p, { agent, token, body, at = port } = {}) {
+  async function api(method, p, { agent, token, body, human, at = port } = {}) {
     const headers = { 'content-type': 'application/json' };
     if (agent) Object.assign(headers, { 'x-bus-agent': agent, 'x-bus-team': 'fe' });
     if (token) headers['x-bus-token'] = token;
+    if (human) headers['x-bus-human'] = srv.humanToken;
     const res = await fetch(`http://127.0.0.1:${at}${p}`, { method, headers, body: body ? JSON.stringify(body) : undefined });
     return { status: res.status, data: await res.json() };
   }
@@ -220,7 +226,7 @@ describe('BUS_AUTH per-agent tokens', () => {
     const ok = await api('POST', '/api/join', { agent: 'alice', token });
     assert.equal(ok.status, 200);
     assert.equal(ok.data.token, undefined, 'no new token on re-join');
-    assert.equal((await api('GET', '/api/claims')).status, 200);
+    assert.equal((await api('GET', '/api/claims', { human: true })).status, 200);
   });
   test('unknown agents must join first and are not registered by other calls', async () => {
     const r = await api('POST', '/api/send', { agent: 'mallory', body: { to: '#general', text: 'hi' } });
@@ -229,14 +235,16 @@ describe('BUS_AUTH per-agent tokens', () => {
     assert.equal(srv.bus.s.agents.mallory, undefined);
   });
   test('tokens never leave the server through /api/state', async () => {
-    const s = await api('GET', '/api/state');
+    const s = await api('GET', '/api/state', { human: true });
+    assert.equal(s.status, 200);
+    assert.ok(s.data.agents.alice, 'real state came back');
     assert.equal(s.data.tokens, undefined);
     assert.ok(!JSON.stringify(s.data).includes(srv.bus.s.tokens.alice));
   });
   test('only the human resets a token; the agent can then join again', async () => {
     const { data: { token } } = await api('POST', '/api/join', { agent: 'bob' });
     assert.equal((await api('POST', '/api/auth/reset', { agent: 'bob', token, body: { agent: 'bob' } })).status, 403);
-    assert.deepEqual((await api('POST', '/api/auth/reset', { body: { agent: 'bob' } })).data, { agent: 'bob', reset: true });
+    assert.deepEqual((await api('POST', '/api/auth/reset', { human: true, body: { agent: 'bob' } })).data, { agent: 'bob', reset: true });
     const again = await api('POST', '/api/join', { agent: 'bob' });
     assert.equal(again.status, 200);
     assert.ok(again.data.token && again.data.token !== token);
@@ -259,7 +267,9 @@ describe('BUS_AUTH per-agent tokens', () => {
     const denied = await bus(['claims'], { cwd: sub, env });
     assert.equal(denied.code, 1);
     assert.match(denied.stderr, /^bus: bad or missing token for carol — .*bus auth reset carol$/);
-    const reset = await bus(['auth', 'reset', 'carol'], { cwd: r, env: { BUS_URL: `http://127.0.0.1:${port}` } });
+    const home = fresh('home');
+    fs.writeFileSync(path.join(home, `${port}.human.token`), srv.humanToken + '\n'); // what `bus serve` writes
+    const reset = await bus(['auth', 'reset', 'carol'], { cwd: r, env: { BUS_URL: `http://127.0.0.1:${port}`, AGENTIC_CHAT_HOME: home } });
     assert.equal(reset.stdout, 'token for carol reset — it can bus join again');
   });
   test('the edit guard blocks an agent whose token is missing', async () => {

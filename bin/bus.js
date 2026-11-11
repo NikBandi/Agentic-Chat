@@ -3,6 +3,7 @@
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { request, tokenFile } from '../src/client.js';
+import { writeHumanToken, removeHumanToken } from '../src/human.js';
 import { createServer, DEFAULT_PORT } from '../src/server.js';
 
 const TRUNC = 200;
@@ -71,8 +72,10 @@ const commands = {
     const dataFile = path.resolve(takeFlag(args, '--data', true) || process.env.BUS_DATA || '.bus/state.json');
     const srv = createServer({ port, dataFile });
     const p = await srv.listen();
+    writeHumanToken(p, srv.humanToken);
     console.log(`bus listening on http://127.0.0.1:${p} (data: ${dataFile})`);
-    const stop = async () => { await srv.close(); process.exit(0); };
+    console.log(`dashboard: http://127.0.0.1:${p}/#t=${srv.humanToken}`);
+    const stop = async () => { removeHumanToken(p, srv.humanToken); await srv.close(); process.exit(0); };
     process.on('SIGINT', stop);
     process.on('SIGTERM', stop);
   },
@@ -213,7 +216,7 @@ const commands = {
 
   async hook([sub]) {
     const hooks = await import('../src/hooks.js');
-    const fn = { pre: hooks.preEdit, post: hooks.postTool, commit: () => hooks.preCommit() }[sub];
+    const fn = { pre: hooks.preEdit, post: hooks.postTool, bash: hooks.preBash, commit: () => hooks.preCommit() }[sub];
     if (!fn) throw new Error(`unknown hook "${sub}"`);
     process.exit(await fn());
   },

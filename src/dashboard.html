@@ -125,9 +125,22 @@ function toast(msg) {
   $('toast').append(d);
   setTimeout(() => d.remove(), 6000);
 }
+// Human token: arrives once in the #t=... link printed by `bus serve`, then lives in sessionStorage (this tab only).
+const HUMAN_TOKEN = (() => {
+  try {
+    const m = /[#&]t=([^&]+)/.exec(location.hash);
+    if (m) {
+      sessionStorage.setItem('busHumanToken', decodeURIComponent(m[1]));
+      history.replaceState(null, '', location.pathname + location.search); // keep it out of the address bar
+    }
+    return sessionStorage.getItem('busHumanToken') || '';
+  } catch { return ''; }
+})();
+const HUMAN_HDR = HUMAN_TOKEN ? { 'x-bus-human': HUMAN_TOKEN } : {};
+
 async function api(path, body) {
   try {
-    const r = await fetch(path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+    const r = await fetch(path, { method: 'POST', headers: { 'content-type': 'application/json', ...HUMAN_HDR }, body: JSON.stringify(body) });
     const j = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(j.error || r.status + ' ' + r.statusText);
     refresh();
@@ -141,7 +154,7 @@ async function refresh() {
   if (inflight) { again = true; return; }
   inflight = true;
   try {
-    const r = await fetch('/api/state');
+    const r = await fetch('/api/state', { headers: HUMAN_HDR });
     if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || 'state ' + r.status);
     S = await r.json();
     render();
@@ -152,7 +165,7 @@ async function refresh() {
 let timer = 0;
 function schedule() { clearTimeout(timer); timer = setTimeout(refresh, 80); }
 function connect() {
-  const es = new EventSource('/api/events');
+  const es = new EventSource('/api/events' + (HUMAN_TOKEN ? '?t=' + encodeURIComponent(HUMAN_TOKEN) : ''));
   es.addEventListener('change', schedule);
   es.onopen = () => { setConn(true); refresh(); };
   es.onerror = () => setConn(false);

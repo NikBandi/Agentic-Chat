@@ -45,7 +45,7 @@ The lead session uses `BUS_AGENT=lead`. Commands run without `BUS_AGENT` act as 
 - A claim succeeds completely or not at all. Overlap checks for globs are conservative.
 - Paths are repo-relative with forward slashes, and case-insensitive on Windows.
 - The edit-guard hook (exit code 2) blocks Claude Code's Edit/Write/MultiEdit/NotebookEdit on files claimed by another agent. When `BUS_AGENT` is unset it allows the edit silently.
-- **Git pre-commit guard:** `bus init` also installs `pre-commit` in the repo's hooks dir. That's the common dir shared by all worktrees, and `core.hooksPath` is honoured. The guard checks every staged file with the bus and blocks the commit with one line (`bus: commit blocked — <file> is claimed by <agent>; …`) when a file is claimed by another agent, or is a hot file and the committer isn't the lead. This catches edits made through shell commands, which the edit guard can't see. It allows the commit when `BUS_AGENT` is unset (the human), when the bus is down, and when concluding a merge (`MERGE_HEAD` exists, which is the lead merging approved work). An existing pre-commit hook is never overwritten: it's renamed to `pre-commit.pre-bus` and runs first.
+- **Git pre-commit guard:** `bus init` also installs `pre-commit` in the repo's hooks dir. That's the common dir shared by all worktrees, and `core.hooksPath` is honoured. The guard checks every staged file with the bus and blocks the commit with one line (`bus: commit blocked — <file> is claimed by <agent>; …`) when a file is claimed by another agent, or is a hot file and the committer isn't the lead. This catches edits made through shell commands, which the edit guard can't see. It allows the commit when `BUS_AGENT` is unset (the human), when the bus is down, and when **the lead** concludes a merge (`MERGE_HEAD` exists): approved work stays claimed until `bus task merged`. A worker's merge commit is checked like any other, so claimed files can't be slipped in through a merge. An existing pre-commit hook is never overwritten: it's renamed to `pre-commit.pre-bus` and runs first.
 - **Bus down:** if a hook can't reach the bus while `BUS_AGENT` is set, it allows the edit or commit and prints one line once: `bus: server unreachable — edits are NOT being guarded`. The Claude Code hooks put that line in the agent's context and show it to you. A marker file in the temp dir, keyed on agent and port, keeps it to once, and the marker is cleared as soon as the bus answers again.
 
 ## Tasks
@@ -91,7 +91,22 @@ This is off by default, so existing setups keep working. Start the server with `
 - On an agent's first `bus join`, the server issues a random token. The CLI saves it in `<worktree>/.bus/agents/<name>.token`, and `.bus/` gets its own `.gitignore` so the token is never committed. The server keeps only a SHA-256 of the token and never serves it, not even through `/api/state`.
 - Every later request from that agent must send the token. The CLI and the hooks find it by looking upward from the current directory. Without a valid token the request fails with 401, the edit guard and pre-commit guard block, and a token-less `bus join` can't take over the name.
 - Lost a token? The human runs `bus auth reset <agent>`, and the agent joins again.
-- **Limitation:** the human is still identified by sending no `x-bus-agent` header, so a process that unsets `BUS_AGENT` acts as the human. Tokens stop agents impersonating each other; they don't stop an agent impersonating you.
+
+## Human lock
+
+- **Human token:** every `bus serve` creates a fresh human token and saves it to `~/.agentic-chat/<port>.human.token`, outside every repo. It also prints the dashboard link with the token in it: `dashboard: http://127.0.0.1:4477/#t=…`. Open that link once. The dashboard moves the token into `sessionStorage` (this tab only), removes it from the address bar, and sends it on every request. Human CLI commands (run without `BUS_AGENT`) read the token file automatically. The file is deleted on a clean shutdown.
+- **With `BUS_AUTH=1`,** any request with no agent name (or the name `you`) needs the human token, or it gets 401. That covers everything only the human can do (approve, reject, `auth reset`, releasing another agent's claims) and the dashboard's own reads. Without `BUS_AUTH` nothing changes.
+- **Shell guard:** `bus init` adds a PreToolUse hook on `Bash|PowerShell`. For agent sessions (`BUS_AGENT` set), it blocks commands that run `bus approve|reject|auth`, call those API endpoints, unset or override `BUS_AGENT` (`unset`, `BUS_AGENT=…`, `export`, `env -u`/`-i`, `$env:BUS_AGENT`, `set`), or touch `~/.agentic-chat`. Each block is one line: `bus: blocked — this command … Agents can't act as the human; ask @you.` It errs toward blocking, so a commit message that contains `bus approve` is refused too.
+- **Deny rules:** `bus init` also adds `Read(~/.agentic-chat/**)` and `Edit(~/.agentic-chat/**)` to `permissions.deny` in `.claude/settings.json`.
+- **Merge commits:** the pre-commit guard exempts only the lead concluding a merge.
+
+**What this does and doesn't protect against:** these are guard rails against mistakes and casual misuse. They stop an agent that follows instructions badly, guesses at a shortcut, or tries the obvious workaround. They are **not** a security boundary against a malicious process running as your user:
+- Such a process can read `~/.agentic-chat` with tools the hooks don't see.
+- It can write a script that calls the API.
+- It can edit `.claude/settings.json` or `.git/hooks`.
+- It can talk to the server directly; the server binds to 127.0.0.1, which keeps out other machines but not other programs on yours.
+
+Pattern-matching shell commands can always be evaded with enough effort. For real isolation, run agents as a separate OS user or in a container that can't read your home directory.
 
 ## Orca
 

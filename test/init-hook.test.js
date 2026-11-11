@@ -15,9 +15,11 @@ describe('bus init', () => {
     const s = { permissions: { allow: ['Bash(ls)'] }, hooks: { PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: 'other' }] }] } };
     assert.equal(mergeSettings(s), true);
     assert.equal(mergeSettings(s), false);
-    assert.deepEqual(s.permissions, { allow: ['Bash(ls)'] });
-    assert.equal(s.hooks.PreToolUse.length, 2);
+    assert.deepEqual(s.permissions.allow, ['Bash(ls)']);
+    assert.equal(s.hooks.PreToolUse.length, 3);
     assert.equal(s.hooks.PreToolUse[1].matcher, 'Edit|Write|MultiEdit|NotebookEdit');
+    assert.equal(s.hooks.PreToolUse[2].matcher, 'Bash|PowerShell');
+    assert.match(s.hooks.PreToolUse[2].hooks[0].command, / hook bash$/);
     assert.equal(s.hooks.PostToolUse[0].matcher, '*');
     assert.match(s.hooks.PostToolUse[0].hooks[0].command, / hook post$/);
   });

@@ -6,6 +6,7 @@ import path from 'node:path';
 import { request, baseUrl, NotRunning } from './client.js';
 import { toRepoPath } from './paths.js';
 import { git } from './check.js';
+import { cleanName, LEAD } from './bus.js';
 
 export const DOWN_MSG = 'bus: server unreachable — edits are NOT being guarded';
 
@@ -97,14 +98,45 @@ export async function preEdit() {
   return 2;
 }
 
+// ---- shell guard: agents can't act as the human or shed their identity ------------------------------
+
+const SHELL_RULES = [
+  [/\bbus(?:\.js)?["']?\s+(?:approve|reject|auth)\b/i, 'approve/reject/auth are human-only bus commands'],
+  [/\/api\/(?:approve|reject|auth)\b/i, 'calls a human-only bus endpoint'],
+  [/\bunset\b[^;&|\n]*\bBUS_AGENT\b/, 'unsets BUS_AGENT'],
+  [/(?<![$\w])BUS_AGENT\s*=(?!=)/, 'overrides BUS_AGENT'], // BUS_AGENT=x cmd, export BUS_AGENT=, $env:BUS_AGENT = , set BUS_AGENT=
+  [/-u\s*BUS_AGENT\b|--unset[= ]BUS_AGENT\b/, 'unsets BUS_AGENT'],
+  [/\benv:BUS_AGENT\b/i, 'changes BUS_AGENT'], // Remove-Item env:BUS_AGENT, Set-Item env:BUS_AGENT
+  [/\benv\s+(?:-\S+\s+)*(?:-i\b|--ignore-environment\b|-\s)/, 'clears the environment (drops BUS_AGENT)'],
+  [/\.agentic-chat\b/, "touches the human's token directory (~/.agentic-chat)"],
+];
+
+/** One-line reason a shell command is refused for an agent, or null. */
+export function bashBlockReason(cmd) {
+  const c = String(cmd ?? '');
+  for (const [re, why] of SHELL_RULES) if (re.test(c)) return why;
+  return null;
+}
+
+/** PreToolUse on Bash|PowerShell: block human-only bus commands and BUS_AGENT changes (exit 2, one line). */
+export async function preBash() {
+  if (!process.env.BUS_AGENT) return 0; // the human's own sessions are not restricted
+  const input = await readStdin();
+  const why = bashBlockReason(input.tool_input?.command);
+  if (!why) return 0;
+  process.stderr.write(`bus: blocked — this command ${why}. Agents can't act as the human; ask @you.\n`);
+  return 2;
+}
+
 /**
  * git pre-commit: block commits that stage files claimed by another agent (or hot files, unless lead).
  * Catches edits made through shell commands, which the PreToolUse guard can't see.
- * Allowed: no BUS_AGENT, bus down, nothing staged, or concluding a merge (the lead merging approved work).
+ * Allowed: no BUS_AGENT (the human), bus down, nothing staged, or the lead concluding a merge (merging approved
+ * work whose files are still claimed until `bus task merged`). A worker's merge commit is checked like any other.
  */
 export async function preCommit(cwd = process.cwd()) {
   if (!process.env.BUS_AGENT) return 0;
-  if ((await git(['rev-parse', '-q', '--verify', 'MERGE_HEAD'], cwd)).code === 0) return 0;
+  if (cleanName(process.env.BUS_AGENT) === LEAD && (await git(['rev-parse', '-q', '--verify', 'MERGE_HEAD'], cwd)).code === 0) return 0;
   const staged = await git(['diff', '--cached', '--name-only', '--no-renames', '-z'], cwd);
   if (staged.code !== 0) return 0;
   const files = staged.out.split('\0').filter(Boolean);

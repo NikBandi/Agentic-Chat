@@ -16,7 +16,8 @@ export function createServer({
   dataFile = null, port = DEFAULT_PORT, host = '127.0.0.1',
   inactiveMs = (Number(process.env.BUS_INACTIVE_MIN) || 30) * 60_000,
   repoDir = process.cwd(), // merges are verified here when the lead's worktree is unknown
-  auth = process.env.BUS_AUTH === '1', // per-agent tokens (off by default)
+  auth = process.env.BUS_AUTH === '1', // per-agent tokens + human token (off by default)
+  humanToken = crypto.randomBytes(24).toString('base64url'), // `bus serve` writes it to ~/.agentic-chat/<port>.human.token
 } = {}) {
   const store = new Store(dataFile);
   const bus = new Bus(store);
@@ -35,6 +36,16 @@ export function createServer({
     if (!crypto.timingSafeEqual(Buffer.from(got), Buffer.from(want))) {
       throw new BusError(`bad or missing token for ${who} — run bus from the worktree that joined, or ask the human: bus auth reset ${who}`, 401);
     }
+  }
+  /** BUS_AUTH: an identity-less caller is the human only with the human token. */
+  const sameSecret = (a, b) => {
+    const x = crypto.createHash('sha256').update(String(a ?? '')).digest();
+    const y = crypto.createHash('sha256').update(String(b)).digest();
+    return crypto.timingSafeEqual(x, y);
+  };
+  function requireHuman(given) {
+    if (!auth || sameSecret(given, humanToken)) return;
+    throw new BusError('human token required — open the dashboard link bus serve printed, or run bus where ~/.agentic-chat is readable', 401);
   }
   function issueToken(who) {
     if (!auth || who === HUMAN || bus.s.tokens[who]) return undefined;
@@ -137,6 +148,7 @@ export function createServer({
       if (!route) {
         if (req.method === 'GET' && url.pathname === '/') return send(res, 200, dashboardHtml(), 'text/html');
         if (req.method === 'GET' && url.pathname === '/api/events') {
+          requireHuman(url.searchParams.get('t')); // EventSource can't send headers: token rides in ?t=
           res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
           res.write(`event: change\ndata: ${bus.s.seq}\n\n`);
           sse.add(res);
@@ -145,7 +157,8 @@ export function createServer({
         }
         throw new BusError(`no route ${req.method} ${url.pathname}`, 404);
       }
-      const who = cleanName(hdr(req, 'x-bus-agent')) || HUMAN;
+      const who = cleanName(hdr(req, 'x-bus-agent')) || HUMAN; // naming yourself "you" is the same as no name
+      if (who === HUMAN) requireHuman(hdr(req, 'x-bus-human'));
       authenticate(who, req, url.pathname === '/api/join'); // before touch(): unproven agents aren't registered
       const me = who === HUMAN ? null : bus.touch(who, hdr(req, 'x-bus-team'), hdr(req, 'x-bus-cwd'));
       const body = req.method === 'POST' ? await readBody(req) : {};
@@ -160,7 +173,7 @@ export function createServer({
   server.headersTimeout = 30_000;
 
   return {
-    bus, tasks, store, server,
+    bus, tasks, store, server, humanToken,
     listen: () => new Promise((ok, fail) => { server.once('error', fail); server.listen(port, host, () => ok(server.address().port)); }),
     close: () => new Promise((ok) => { clearInterval(heartbeat); clearInterval(sweeper); clearTimeout(changeTimer); for (const r of sse) r.end(); store.flush(); server.closeAllConnections?.(); server.close(() => ok()); }),
   };

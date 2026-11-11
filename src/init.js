@@ -24,16 +24,23 @@ ${END}`;
 
 const hookCmd = (sub) => `node "${BUS_BIN.replace(/\\/g, '/')}" hook ${sub}`;
 
-export const HOOKS = {
-  PreToolUse: { matcher: 'Edit|Write|MultiEdit|NotebookEdit', sub: 'pre' },
-  PostToolUse: { matcher: '*', sub: 'post' },
-};
+export const HOOKS = [
+  { event: 'PreToolUse', matcher: 'Edit|Write|MultiEdit|NotebookEdit', sub: 'pre' },
+  { event: 'PreToolUse', matcher: 'Bash|PowerShell', sub: 'bash' },
+  { event: 'PostToolUse', matcher: '*', sub: 'post' },
+];
 
-/** Add (or update) our hook entries in a settings object. Returns true if it changed. */
+/** Agents may not read (or write) the human's token directory. */
+export const DENY = ['Read(~/.agentic-chat/**)', 'Edit(~/.agentic-chat/**)'];
+
+/** Add (or update) our hook entries and deny rules in a settings object. Returns true if it changed. */
 export function mergeSettings(settings) {
   let changed = false;
   settings.hooks ??= {};
-  for (const [event, { matcher, sub }] of Object.entries(HOOKS)) {
+  settings.permissions ??= {};
+  const deny = (settings.permissions.deny ??= []);
+  for (const rule of DENY) if (!deny.includes(rule)) { deny.push(rule); changed = true; }
+  for (const { event, matcher, sub } of HOOKS) {
     const list = (settings.hooks[event] ??= []);
     const cmd = hookCmd(sub);
     const isOurs = (h) => typeof h.command === 'string' && /bus\.js"? hook /.test(h.command) && h.command.endsWith(` hook ${sub}`);

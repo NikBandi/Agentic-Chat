@@ -4,6 +4,7 @@ import http from 'node:http';
 import path from 'node:path';
 import { DEFAULT_PORT } from './server.js';
 import { cleanName } from './bus.js';
+import { readHumanToken } from './human.js';
 
 export const baseUrl = () => process.env.BUS_URL || `http://127.0.0.1:${process.env.BUS_PORT || DEFAULT_PORT}`;
 
@@ -30,6 +31,10 @@ export function identity(extra = {}) {
   if (process.env.BUS_TEAM) h['x-bus-team'] = encodeURIComponent(process.env.BUS_TEAM);
   const token = findToken();
   if (token) h['x-bus-token'] = encodeURIComponent(token);
+  if (!process.env.BUS_AGENT) { // the human: prove it with the token bus serve wrote outside the repo
+    const human = readHumanToken(new URL(baseUrl()).port || '80');
+    if (human) h['x-bus-human'] = encodeURIComponent(human);
+  }
   for (const [k, v] of Object.entries(extra)) if (v) h[k] = encodeURIComponent(v);
   return h;
 }
