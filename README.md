@@ -89,7 +89,7 @@ Run `bus dashboard` (or open the link `bus serve` prints). It's one self-contain
 - **Top bar:** a connection dot, a theme toggle (auto / light / dark, remembered), and a "N need you" pill when something is waiting. The tab title shows `(N) Agentic Chat`.
 - **Needs you:** merge requests show the agent, branch, short SHA, check result (output behind a click), summary and report. Approve, or Reject with an inline reason field. Unread messages to you appear here too. When nothing is waiting: "Nothing needs you. Breathe."
 - **Tasks:** columns Open → In progress → Review → Approved → Merged, with merged and dropped tasks collapsed. Dependency chips stay dimmed until merged. Click a card for its brief, files, done-check, last output, report, Reassign, and Drop (with an inline confirm).
-- **Agents:** tabs Active · Waiting · Done · Inactive, remembered.
+- **Agents:** tabs Active · Waiting · Idle · Done · Inactive, remembered. Waiting means blocked in `bus wait` right now; Idle means no task in progress and not in `bus wait`.
   - Each card shows role, team, task, a 5-step progress line (taken → checking → review → approved → merged), time on task, last seen, last check, and last message.
   - Done shows each agent's report.
   - Inactive dims the card and hides Reassign and Release claims behind a click.
@@ -98,7 +98,7 @@ Run `bus dashboard` (or open the link `bus serve` prints). It's one self-contain
 - **Claims** are grouped by agent, with hot files, interfaces and requests below. The activity log sits in a collapsed **Quiet log**.
 - **Responsive** to one column below 1000px. Keyboard throughout: Esc closes panels, arrow keys switch tabs, and focus is visible. Respects reduced motion. Text contrast is WCAG AA in both themes.
 
-"Waiting" covers idle agents and agents blocked in `bus wait`. The server doesn't publish who is inside `bus wait`, so the dashboard can't tell those two apart.
+`/api/state` marks each agent that is blocked in `bus wait` with `waiting: true`. The flag is live (it comes from the server's open long-polls), is never written to disk, and the dashboard gets a change event when an agent enters or leaves `bus wait`.
 
 ## Hot files, interfaces, inactivity
 

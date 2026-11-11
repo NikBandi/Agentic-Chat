@@ -179,6 +179,18 @@ describe('dashboard carries the human token', () => {
     assert.match(html, /No agents yet — start one with BUS_AGENT=name claude/);
     assert.ok(!/gradient\(|<link(?![^>]*href="data:)|<script src|@import|https?:\/\/(?!127)/.test(html), 'self-contained: no gradients, CDNs or external fonts');
   });
+  test('agent tabs: Waiting means blocked in bus wait (live flag), Idle is everyone else without work', () => {
+    const src = html.match(/function agentState\(a\) \{[\s\S]*?\n\}/)[0];
+    const tasks = [{ id: 1, owner: 'w', status: 'in_progress' }, { id: 2, owner: 'd', status: 'merged' }];
+    const agentState = new Function('S', 'taskById', src + '; return agentState;')({ tasks }, (id) => tasks.find((t) => t.id === id));
+    assert.equal(agentState({ name: 'w', task: 1 }), 'active');
+    assert.equal(agentState({ name: 'w', task: 1, waiting: true }), 'waiting');
+    assert.equal(agentState({ name: 'i', task: null, waiting: true }), 'waiting');
+    assert.equal(agentState({ name: 'i', task: null }), 'idle');
+    assert.equal(agentState({ name: 'd', task: null }), 'done');
+    assert.equal(agentState({ name: 'x', task: null, inactive: true }), 'inactive');
+    assert.match(html, /AGENT_TABS = \['active', 'waiting', 'idle', 'done', 'inactive'\]/);
+  });
 });
 
 describe('shell guard (PreToolUse on Bash|PowerShell)', () => {

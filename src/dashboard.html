@@ -70,7 +70,7 @@ input::placeholder{color:var(--ink-soft)}
 .chip.s-review{color:var(--ochre)}
 .chip.s-merged .dot{opacity:.6}
 .chip.s-dropped .lbl{text-decoration:line-through}
-.dot.a-active{background:var(--moss)}.dot.a-waiting{background:var(--indigo)}.dot.a-inactive{background:var(--ochre)}.dot.a-done{background:var(--ink-soft)}
+.dot.a-active{background:var(--moss)}.dot.a-waiting{background:var(--indigo)}.dot.a-inactive{background:var(--ochre)}.dot.a-done{background:var(--ink-soft)}.dot.a-idle{background:transparent;box-shadow:inset 0 0 0 1.5px var(--ink-soft)}
 .dot.conn-on{background:var(--moss)}.dot.conn-off{background:var(--beni)}
 .dep{font-family:var(--mono);font-size:11.5px;padding:1px 7px;border-radius:999px;background:var(--surface-2)}
 .dep.waiting{color:var(--ink-soft)}
@@ -133,6 +133,7 @@ details[open]>summary{margin-bottom:8px}
 .tabs{display:flex;gap:2px;margin:0 -6px 16px;flex-wrap:wrap}
 .tab{border:0;background:none;border-radius:999px;padding:3px 9px;font-size:13px;cursor:pointer;color:var(--ink-soft)}
 .tab[aria-selected=true]{background:var(--surface-2);color:var(--ink)}
+@media (max-width:560px){.tab{padding:3px 6px;font-size:12.5px}}
 .acard{display:block;width:100%;text-align:left;border:0;background:none;border-radius:12px;padding:12px 12px;cursor:pointer;transition:background-color .16s ease-out,opacity .18s ease-out}
 .acard:hover{background:var(--surface-2)}
 .acard.dim{opacity:.62}
@@ -266,8 +267,9 @@ const $ = (id) => document.getElementById(id);
 const HUMAN = 'you';
 const STEPS = ['taken', 'checking', 'review', 'approved', 'merged'];
 const STATUS_LABEL = { open: 'Open', in_progress: 'In progress', review: 'Review', approved: 'Approved', merged: 'Merged', dropped: 'Dropped' };
-const AGENT_TABS = ['active', 'waiting', 'done', 'inactive'];
-const TAB_LABEL = { active: 'Active', waiting: 'Waiting', done: 'Done', inactive: 'Inactive' };
+const AGENT_TABS = ['active', 'waiting', 'idle', 'done', 'inactive'];
+const TAB_LABEL = { active: 'Active', waiting: 'Waiting', idle: 'Idle', done: 'Done', inactive: 'Inactive' };
+const TAB_HINT = { waiting: 'blocked in bus wait', idle: 'no task in progress, not in bus wait' };
 let S = null;
 
 // ---- small helpers ------------------------------------------------------------------------------
@@ -390,11 +392,12 @@ function isFor(m, a) {
 const toMe = (m) => m.from !== HUMAN && (m.to === HUMAN || (m.mentions || []).includes(HUMAN));
 function agentState(a) {
   if (a.inactive) return 'inactive';
+  if (a.waiting) return 'waiting'; // live from the server: blocked in `bus wait` right now
   const t = a.task != null && taskById(a.task);
   if (t && (t.status === 'in_progress' || t.status === 'review')) return 'active';
   const took = S.tasks.filter((x) => x.owner === a.name);
   if (!t && took.length && took.every((x) => x.status === 'merged')) return 'done';
-  return 'waiting';
+  return 'idle';
 }
 function stepOf(t) {
   if (!t) return -1;
@@ -541,19 +544,20 @@ function renderBoard() {
 
 // ---- agents ----
 let tab = store.get('busAgentTab', 'active');
+if (!AGENT_TABS.includes(tab)) tab = 'active';
 const optsOpen = new Set();
 function renderAgents() {
   const as = Object.values(S.agents).sort((a, b) => a.name.localeCompare(b.name));
   const groups = Object.fromEntries(AGENT_TABS.map((k) => [k, []]));
   for (const a of as) groups[agentState(a)].push(a);
   const tabs = $('tabs');
-  fill(tabs, ...AGENT_TABS.map((k) => h('button', { class: 'tab', role: 'tab', id: 'tab-' + k, type: 'button', 'aria-selected': String(k === tab), 'aria-controls': 'agentList', tabindex: k === tab ? '0' : '-1',
+  fill(tabs, ...AGENT_TABS.map((k) => h('button', { class: 'tab', role: 'tab', id: 'tab-' + k, type: 'button', 'aria-selected': String(k === tab), 'aria-controls': 'agentList', tabindex: k === tab ? '0' : '-1', title: TAB_HINT[k] || null,
     onclick: () => selectTab(k), onkeydown: tabKeys }, TAB_LABEL[k] + ' · ' + groups[k].length)));
   const list = $('agentList');
   list.setAttribute('aria-labelledby', 'tab-' + tab);
   const mine = groups[tab];
   if (!as.length) { fill(list, h('p', { class: 'empty' }, 'No agents yet — start one with BUS_AGENT=name claude')); return; }
-  if (!mine.length) { fill(list, h('p', { class: 'empty' }, { active: 'Nobody is working on a task right now.', waiting: 'Nobody is waiting.', done: 'No one has finished yet.', inactive: 'Everyone is active.' }[tab])); return; }
+  if (!mine.length) { fill(list, h('p', { class: 'empty' }, { active: 'Nobody is working on a task right now.', waiting: 'Nobody is blocked in bus wait.', idle: 'Nobody is idle.', done: 'No one has finished yet.', inactive: 'Everyone is active.' }[tab])); return; }
   fill(list, ...mine.map((a) => enter(list, a.name + tab, agentCard(a, tab))));
 }
 function selectTab(k) { tab = k; store.set('busAgentTab', k); renderAgents(); $('tab-' + k)?.focus(); }
@@ -571,7 +575,7 @@ function agentCard(a, state) {
   const r = t && t.result;
   const role = a.name === 'lead' ? 'lead' : 'worker';
   const card = h('button', { class: 'acard' + (state === 'inactive' ? ' dim' : ''), id: 'agent-' + a.name, type: 'button', onclick: () => openDrawer('agent', a.name), 'aria-label': `${a.name}, ${TAB_LABEL[state]}. Open history` },
-    h('span', { class: 'aname' }, h('span', { class: 'dot a-' + state, 'aria-hidden': 'true' }), a.name, h('span', { class: 'role' }, role + ' · ' + (a.team || '-') + ' · ' + TAB_LABEL[state].toLowerCase())),
+    h('span', { class: 'aname' }, h('span', { class: 'dot a-' + state, 'aria-hidden': 'true' }), a.name, h('span', { class: 'role' }, role + ' · ' + (a.team || '-') + ' · ' + (state === 'waiting' ? 'in bus wait' : TAB_LABEL[state].toLowerCase()))),
     t ? h('span', { style: 'display:block;margin-top:4px;overflow-wrap:anywhere' }, '#' + t.id + ' ' + t.title) : null,
     t && step >= 0 ? h('span', { class: 'steps s-' + t.status, role: 'img', 'aria-label': `Step ${step + 1} of 5: ${STEPS[step]}` },
       STEPS.map((s, i) => h('i', { class: i < step ? 'past' : i === step ? 'now' : '', title: s }))) : null,

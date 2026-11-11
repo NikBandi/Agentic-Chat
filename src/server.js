@@ -60,13 +60,14 @@ export function createServer({
   // Dashboard live updates (SSE). Any state change -> one debounced "change" event; clients refetch /api/state.
   const sse = new Set();
   let changeTimer = null;
-  store.onChange = () => {
+  const changed = () => {
     if (!sse.size || changeTimer) return;
     changeTimer = setTimeout(() => {
       changeTimer = null;
       for (const res of sse) res.write(`event: change\ndata: ${bus.s.seq}\n\n`);
     }, 100);
   };
+  store.onChange = changed;
   const heartbeat = setInterval(() => { for (const res of sse) res.write(': ping\n\n'); }, 25_000);
   heartbeat.unref();
 
@@ -108,7 +109,8 @@ export function createServer({
     'POST /api/request': ({ who, body }) => ({ request: bus.request(need(who), body.file, body.text) }),
     'POST /api/request/resolve': ({ who, body }) => ({ request: bus.resolveRequest(who, body.id, body.verdict, body.why) }),
     'POST /api/iface': ({ who, body }) => ({ interfaces: body.rm ? bus.ifaceRm(who, body.path) : bus.ifaceAdd(who, body.path, arr(body.teams)) }),
-    'GET /api/state': () => ({ ...bus.s, tokens: undefined }),
+    // `waiting` is live (who is blocked in bus wait right now), never persisted.
+    'GET /api/state': () => ({ ...bus.s, tokens: undefined, agents: Object.fromEntries(Object.entries(bus.s.agents).map(([n, a]) => [n, waiters.has(n) ? { ...a, waiting: true } : a])) }),
     'POST /api/wait': waitRoute,
     'POST /api/task/add': ({ who, body }) => ({ task: tasks.add(who, { ...body, files: arr(body.files), after: arr(body.after) }) }),
     'GET /api/task/list': ({ who, q }) => ({ tasks: tasks.list(who, !!q.get('mine')) }),
@@ -129,11 +131,11 @@ export function createServer({
     if (bus.pending(name) > 0) return bus.read(name);
     return new Promise((resolve) => {
       const set = waiters.get(name) ?? new Set();
-      waiters.set(name, set);
+      if (!waiters.has(name)) { waiters.set(name, set); changed(); }
       const done = (result) => {
         clearTimeout(timer);
         set.delete(fire);
-        if (!set.size) waiters.delete(name);
+        if (!set.size && waiters.get(name) === set) { waiters.delete(name); changed(); }
         resolve(result);
       };
       const fire = () => done(bus.read(name));

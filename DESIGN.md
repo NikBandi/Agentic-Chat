@@ -123,7 +123,7 @@ The lead applies or declines the request.
 
 Local web page served by the bus. It's one self-contained file with no dependencies, built on the same `/api/state` and SSE data. It's designed to be quiet: space instead of boxes, color only for meaning, persimmon only when the human must act, and AA contrast in light and dark. It contains:
 - a "Needs you" area first: merge requests (with report) and unread messages to the human
-- agents (name, team, task, active/inactive), in tabs Active · Waiting · Done · Inactive, with per-agent history and reports
+- agents (name, team, task, active/inactive), in tabs Active · Waiting (blocked in `bus wait`, from a live `waiting: true` on `/api/state`) · Idle · Done · Inactive, with per-agent history and reports
 - task board (status, owner, dependencies, done-check result)
 - claims
 - team channels + DMs feed, with a composer so the human can post anywhere
