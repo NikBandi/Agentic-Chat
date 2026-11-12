@@ -191,6 +191,106 @@ describe('spawning', () => {
   });
 });
 
+describe('shared node_modules and worktree cleanup', () => {
+  const G = (cwd, ...a) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...a], { cwd, encoding: 'utf8' }).trim();
+  const branches = () => G(repo, 'branch', '--format=%(refname:short)').split('\n');
+  const pkg = () => path.join(repo, 'node_modules', 'pkg', 'index.js');
+  const seedDeps = () => { fs.mkdirSync(path.dirname(pkg()), { recursive: true }); fs.writeFileSync(pkg(), 'module.exports = 1'); };
+
+  /** Spawn a worker for a new task, commit work in its worktree, pass done, worker exits. Returns {t, wt}. */
+  async function finished({ exit = true } = {}) {
+    const t = feTask({ title: 'Work' });
+    sp.request('fe-lead', t.id);
+    await settle();
+    const wt = sp.s.spawns['frontend-1'].worktree;
+    tasks.take('frontend-1', t.id);
+    fs.writeFileSync(path.join(wt, 'a.txt'), 'x');
+    G(wt, 'add', 'a.txt'); G(wt, 'commit', '-q', '-m', 'work');
+    assert.equal((await tasks.done('frontend-1', t.id)).ok, true);
+    if (exit) { launched[0].exit(0); await settle(); }
+    return { t, wt };
+  }
+  async function approveAndMerge(t) {
+    tasks.approve('you', t.id);
+    G(repo, 'merge', '-q', '--no-edit', t.commit);
+    await tasks.merged('fe-lead', t.id);
+    await sp.cleaning;
+  }
+
+  test('a new worktree links node_modules to the main checkout; git ignores the link', async () => {
+    seedDeps();
+    sp.request('fe-lead', feTask().id);
+    await settle();
+    const wt = sp.s.spawns['frontend-1'].worktree;
+    const link = path.join(wt, 'node_modules');
+    assert.ok(fs.lstatSync(link).isSymbolicLink(), 'a link, not a copy');
+    assert.equal(fs.readFileSync(path.join(link, 'pkg', 'index.js'), 'utf8'), 'module.exports = 1');
+    assert.equal(G(wt, 'status', '--porcelain'), '', 'the link never counts as uncommitted');
+    assert.match(fs.readFileSync(path.join(repo, '.git', 'info', 'exclude'), 'utf8'), /^\/node_modules$/m);
+  });
+
+  test('BUS_SHARE_DEPS=0 or no node_modules in main: no link', async () => {
+    sp.request('fe-lead', feTask().id); // no node_modules yet
+    await settle();
+    assert.ok(!fs.existsSync(path.join(sp.s.spawns['frontend-1'].worktree, 'node_modules')));
+    seedDeps();
+    sp.env = { ...sp.env, BUS_SHARE_DEPS: '0' };
+    sp.request('fe-lead', feTask().id);
+    await settle();
+    assert.ok(!fs.existsSync(path.join(sp.s.spawns['frontend-2'].worktree, 'node_modules')));
+  });
+
+  test('merged: the worktree and its merged branch are removed; main node_modules is untouched', async () => {
+    seedDeps();
+    const { t, wt } = await finished();
+    assert.ok(fs.existsSync(wt));
+    // a BUS_AUTH token lives in the worktree's self-ignored .bus/ — it must not block removal
+    fs.mkdirSync(path.join(wt, '.bus', 'agents'), { recursive: true });
+    fs.writeFileSync(path.join(wt, '.bus', '.gitignore'), '*\n');
+    fs.writeFileSync(path.join(wt, '.bus', 'agents', 'frontend-1.token'), 'secret');
+    await approveAndMerge(t);
+    assert.ok(!fs.existsSync(wt), 'worktree folder removed');
+    assert.ok(!branches().includes('frontend-1'), 'merged branch deleted');
+    assert.ok(fs.existsSync(pkg()), 'shared node_modules survives');
+    assert.ok(fs.existsSync(path.join(repo, 'a.txt')), 'the merged work is in main');
+    assert.equal(sp.s.spawns['frontend-1'].worktree, null);
+    assert.equal(bus.s.agents['frontend-1'].worktree, null);
+  });
+
+  test('merged while the worker is still running: cleanup waits for it to exit', async () => {
+    const { t, wt } = await finished({ exit: false });
+    await approveAndMerge(t);
+    assert.ok(fs.existsSync(wt), 'not removed under a live worker');
+    launched[0].exit(0);
+    await settle(); await sp.cleaning;
+    assert.ok(!fs.existsSync(wt));
+  });
+
+  test('uncommitted changes: the worktree is kept and the reviewer is told', async () => {
+    const { t, wt } = await finished();
+    fs.writeFileSync(path.join(wt, 'stray.txt'), 'oops');
+    await approveAndMerge(t);
+    assert.ok(fs.existsSync(path.join(wt, 'stray.txt')), 'nothing lost');
+    assert.ok(dms('fe-lead').some((m) => /kept .*1 uncommitted file/.test(m)));
+  });
+
+  test('dropped: the worktree is removed but the branch (and its commits) kept', async () => {
+    const { t, wt } = await finished();
+    tasks.drop('fe-lead', t.id);
+    await sp.cleaning;
+    assert.ok(!fs.existsSync(wt));
+    assert.ok(branches().includes('frontend-1'));
+  });
+
+  test('BUS_KEEP_WORKTREES=1 keeps everything', async () => {
+    sp.env = { ...sp.env, BUS_KEEP_WORKTREES: '1' };
+    const { t, wt } = await finished();
+    await approveAndMerge(t);
+    assert.ok(fs.existsSync(wt));
+    assert.ok(branches().includes('frontend-1'));
+  });
+});
+
 describe('worker prompt and args', () => {
   test('prompt is short and self-contained', () => {
     const p = workerPrompt({ name: 'frontend-1', team: 'frontend', task: 3 });

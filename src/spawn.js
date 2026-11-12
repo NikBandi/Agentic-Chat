@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn as cpSpawn, execFile } from 'node:child_process';
 import { BusError, cleanName } from './bus.js';
-import { git, mainBranch } from './check.js';
+import { git, mainBranch, uncommitted } from './check.js';
 import { mergeSettings } from './init.js';
 
 export const DEFAULT_MAX = 4;
@@ -142,12 +142,74 @@ export class Spawner {
 
   async #worktree(name) {
     const wt = path.join(path.dirname(this.repo), `${path.basename(this.repo)}-${name}`);
-    if (fs.existsSync(wt)) return wt; // respawn: keep its branch and commits
-    const main = await mainBranch(this.repo);
-    const exists = (await git(['rev-parse', '--verify', '--quiet', `refs/heads/${name}`], this.repo)).code === 0;
-    const r = await git(exists ? ['worktree', 'add', wt, name] : ['worktree', 'add', '-b', name, wt, main], this.repo);
-    if (r.code !== 0) throw new Error(`git worktree add failed: ${r.err.split('\n')[0]}`);
+    if (!fs.existsSync(wt)) { // else respawn: keep its branch and commits
+      const main = await mainBranch(this.repo);
+      const exists = (await git(['rev-parse', '--verify', '--quiet', `refs/heads/${name}`], this.repo)).code === 0;
+      const r = await git(exists ? ['worktree', 'add', wt, name] : ['worktree', 'add', '-b', name, wt, main], this.repo);
+      if (r.code !== 0) throw new Error(`git worktree add failed: ${r.err.split('\n')[0]}`);
+    }
+    await this.#shareDeps(wt);
     return wt;
+  }
+
+  /**
+   * Point the worktree's node_modules at the main checkout's (a junction on Windows) instead of a fresh install per
+   * worker. Safe because package.json and lockfiles are hot files: workers request changes instead of installing.
+   * The link is excluded in the repo's shared info/exclude, so it never counts as uncommitted. BUS_SHARE_DEPS=0: off.
+   */
+  async #shareDeps(wt) {
+    if (this.env.BUS_SHARE_DEPS === '0') return;
+    const src = path.join(this.repo, 'node_modules');
+    const link = path.join(wt, 'node_modules');
+    if (!fs.existsSync(src) || fs.existsSync(link)) return;
+    try {
+      const common = (await git(['rev-parse', '--path-format=absolute', '--git-common-dir'], this.repo)).out.trim();
+      if (common) {
+        const ex = path.join(common, 'info', 'exclude');
+        const cur = fs.existsSync(ex) ? fs.readFileSync(ex, 'utf8') : '';
+        if (!/^\/node_modules$/m.test(cur)) {
+          fs.mkdirSync(path.dirname(ex), { recursive: true });
+          fs.appendFileSync(ex, (cur && !cur.endsWith('\n') ? '\n' : '') + '/node_modules\n');
+        }
+      }
+      fs.symlinkSync(src, link, 'junction');
+    } catch (e) { this.bus.log(`couldn't share node_modules with ${path.basename(wt)}: ${e.message}`); }
+  }
+
+  /**
+   * Remove a finished worker's worktree: after its task is merged (also deletes the merged branch with git branch -d)
+   * or dropped (keeps the branch, so no commits are lost). Never forces: a worktree with uncommitted changes is kept
+   * and the reviewer is told. Waits for a still-running worker to exit. BUS_KEEP_WORKTREES=1: off.
+   */
+  async #cleanup(w, t) {
+    if (this.env.BUS_KEEP_WORKTREES === '1' || !w.worktree || w.cleaned) return;
+    if (w.status === 'running' || w.status === 'starting') return; // #exited calls us again
+    const wt = w.worktree;
+    w.cleaned = true; // claim it before awaiting, so concurrent events don't race
+    if (fs.existsSync(wt)) {
+      const dirty = await uncommitted(wt);
+      if (dirty) {
+        w.cleaned = false;
+        this.bus.notify(this.tasks.reviewer(t), `kept ${wt}: ${dirty} uncommitted file${dirty === 1 ? '' : 's'} — commit or discard, then git worktree remove it`);
+        return;
+      }
+      // Unlink the shared node_modules first so nothing ever deletes through it into the main checkout.
+      const link = path.join(wt, 'node_modules');
+      try { if (fs.lstatSync(link).isSymbolicLink()) fs.rmSync(link); } catch { /* no link */ }
+      const r = await git(['worktree', 'remove', wt], this.repo);
+      if (r.code !== 0) {
+        w.cleaned = false;
+        this.bus.log(`couldn't remove ${wt}: ${r.err.split('\n')[0]}`);
+        return;
+      }
+    }
+    let branch = 'kept';
+    if (t.status === 'merged') branch = (await git(['branch', '-d', w.name], this.repo)).code === 0 ? 'deleted' : 'kept (not fully merged)';
+    Object.assign(w, { worktree: null });
+    const a = this.s.agents[w.name];
+    if (a) a.worktree = null;
+    this.bus.log(`${w.name}: worktree removed after #${t.id} ${t.status}; branch ${branch}`);
+    this.bus.store.save();
   }
 
   #settingsFile() {
@@ -191,6 +253,7 @@ export class Spawner {
       this.bus.notify(this.tasks.reviewer(t), `${name} exited with #${t.id} unfinished (log: ${w.log}) — bus spawn ${t.id} to retry, or bus task reassign ${t.id} <agent>`);
     }
     this.bus.store.save();
+    if (t && ['merged', 'dropped'].includes(t.status) && w.task === t.id) this.cleaning = this.#cleanup(w, t);
     this.pump();
   }
 
@@ -201,6 +264,9 @@ export class Spawner {
       this.bus.log(`${t.owner} re-queued for rejected #${t.id}`);
     } else if (type === 'dropped' || type === 'reassigned') {
       for (const q of this.list()) if (q.status === 'queued' && q.task === t.id) Object.assign(q, { status: 'exited', note: type });
+    }
+    if (type === 'merged' || type === 'dropped') { // drop clears t.owner, so find the worker by its task
+      for (const q of this.list()) if (q.task === t.id && q.worktree) this.cleaning = this.#cleanup(q, t);
     }
     this.pump(); // a merge may unblock queued dependents; a rejection may have re-queued one
   }
