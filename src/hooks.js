@@ -8,6 +8,9 @@ import { toRepoPath } from './paths.js';
 import { git } from './check.js';
 import { cleanName, LEAD } from './bus.js';
 
+/** A lead-like session (may conclude merges): BUS_ROLE lead|head, or the legacy agent named lead. */
+export const isLeadSession = (env = process.env) => ['lead', 'head'].includes(cleanName(env.BUS_ROLE)) || cleanName(env.BUS_AGENT) === LEAD;
+
 export const DOWN_MSG = 'bus: server unreachable — edits are NOT being guarded';
 
 const readStdin = () => new Promise((ok) => {
@@ -93,7 +96,7 @@ export async function preEdit() {
   reachable();
   if (r.free) return 0;
   process.stderr.write(r.hot
-    ? `bus: ${rel} is a hot file owned by lead. Do not edit it or work around this block. Ask for the change: bus request ${rel} "<change>"\n`
+    ? `bus: ${rel} is a hot file owned by ${r.owner}. Do not edit it or work around this block. Ask for the change: bus request ${rel} "<change>"\n`
     : `bus: ${rel} is claimed by ${r.owner} (${r.claim}). Do not edit it or work around this block. Ask the owner: bus send @${r.owner} "<what you need>"\n`);
   return 2;
 }
@@ -106,6 +109,7 @@ const SHELL_RULES = [
   [/\bunset\b[^;&|\n]*\bBUS_AGENT\b/, 'unsets BUS_AGENT'],
   [/(?<![$\w])BUS_AGENT\s*=(?!=)/, 'overrides BUS_AGENT'], // BUS_AGENT=x cmd, export BUS_AGENT=, $env:BUS_AGENT = , set BUS_AGENT=
   [/-u\s*BUS_AGENT\b|--unset[= ]BUS_AGENT\b/, 'unsets BUS_AGENT'],
+  [/\bunset\b[^;&|\n]*\bBUS_ROLE\b|(?<![$\w])BUS_ROLE\s*=(?!=)|-u\s*BUS_ROLE\b|--unset[= ]BUS_ROLE\b|\benv:BUS_ROLE\b/i, 'changes BUS_ROLE'],
   [/\benv:BUS_AGENT\b/i, 'changes BUS_AGENT'], // Remove-Item env:BUS_AGENT, Set-Item env:BUS_AGENT
   [/\benv\s+(?:-\S+\s+)*(?:-i\b|--ignore-environment\b|-\s)/, 'clears the environment (drops BUS_AGENT)'],
   [/\.agentic-chat\b/, "touches the human's token directory (~/.agentic-chat)"],
@@ -131,12 +135,12 @@ export async function preBash() {
 /**
  * git pre-commit: block commits that stage files claimed by another agent (or hot files, unless lead).
  * Catches edits made through shell commands, which the PreToolUse guard can't see.
- * Allowed: no BUS_AGENT (the human), bus down, nothing staged, or the lead concluding a merge (merging approved
+ * Allowed: no BUS_AGENT (the human), bus down, nothing staged, or a lead/head (BUS_ROLE) concluding a merge (merging approved
  * work whose files are still claimed until `bus task merged`). A worker's merge commit is checked like any other.
  */
 export async function preCommit(cwd = process.cwd()) {
   if (!process.env.BUS_AGENT) return 0;
-  if (cleanName(process.env.BUS_AGENT) === LEAD && (await git(['rev-parse', '-q', '--verify', 'MERGE_HEAD'], cwd)).code === 0) return 0;
+  if (isLeadSession() && (await git(['rev-parse', '-q', '--verify', 'MERGE_HEAD'], cwd)).code === 0) return 0;
   const staged = await git(['diff', '--cached', '--name-only', '--no-renames', '-z'], cwd);
   if (staged.code !== 0) return 0;
   const files = staged.out.split('\0').filter(Boolean);
@@ -156,7 +160,7 @@ export async function preCommit(cwd = process.cwd()) {
   const [f, r] = blocked[0];
   const more = blocked.length > 1 ? ` (+${blocked.length - 1} more)` : '';
   process.stderr.write(r.hot
-    ? `bus: commit blocked — ${f} is a hot file owned by lead${more}; unstage it and ask: bus request ${f} "<change>"\n`
+    ? `bus: commit blocked — ${f} is a hot file owned by ${r.owner}${more}; unstage it and ask: bus request ${f} "<change>"\n`
     : `bus: commit blocked — ${f} is claimed by ${r.owner}${more}; unstage it (git restore --staged ${f}) and ask @${r.owner}\n`);
   return 1;
 }

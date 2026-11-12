@@ -539,7 +539,7 @@ describe('end to end (HTTP server + bus CLI)', () => {
     // a worker cannot add tasks
     r = await cli(port, worker, ['task', 'add', 'nope', '--check', PASS]);
     assert.notEqual(r.code, 0);
-    assert.match(r.err + r.out, /only the lead or the human/);
+    assert.match(r.err + r.out, /only a lead, the head or the human/);
 
     r = await cli(port, lead, ['task', 'add', 'Build thing', '--files', 'src/a.js', '--check', EXISTS_OK, '--for', 'fe']);
     assert.equal(r.code, 0, r.err);

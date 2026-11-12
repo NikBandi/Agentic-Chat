@@ -12,6 +12,7 @@ A local coordination layer that lets many Claude Code agents work on one codebas
 |---|---|---|
 | **Human** | You | Opens each Claude Code session manually. Gives the lead the goal. Approves or rejects merges. Watches the dashboard and can post anywhere. |
 | **Lead agent** | One Claude Code session | Splits the goal into tasks, assigns them, writes each task's done-check, owns the hot files, reviews and merges finished work after human approval, handles escalations and inactive agents. The only agent with the big picture. |
+| **Head + team leads** (optional, `BUS_ROLE`) | One head, one lead per team | For multi-team work, the lead role splits in two. The **head** owns hot files, interfaces and change requests, can manage any team, and reviews and merges tasks a lead owns itself. Each **team lead** (`BUS_ROLE=lead`, with `BUS_TEAM`) plans, reviews and merges only its own team's tasks, and is notified about them. An agent named `lead` without a role is the head. See README "Team leads". |
 | **Worker agents** | Many Claude Code sessions | Each runs in its **own git worktree**, belongs to **one team**, works **one task at a time**. |
 
 Agents are **not** launched automatically. The human starts every session (in Orca's terminal) with a name and team.

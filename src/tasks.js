@@ -1,6 +1,6 @@
 // Tasks: dependencies, take (claims files), done-checks, merge requests, approval, merge, auto-handoff.
 // Lifecycle: open -> in_progress -> review -> approved -> merged      (+ dropped; reject: review -> in_progress)
-import { BusError, HUMAN, LEAD, cleanName } from './bus.js';
+import { BusError, HUMAN, cleanName } from './bus.js';
 import { normPath } from './paths.js';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -8,7 +8,6 @@ import { runCheck, currentBranch, uncommitted, headSha, mainBranch, isAncestor }
 import { parseReport, buildReport, render } from './report.js';
 
 const NAME_RE = /^[a-z0-9][a-z0-9_-]{0,39}$/;
-const isBoss = (who) => who === LEAD || who === HUMAN;
 const num = (id) => Number(String(id ?? '').replace(/^#/, ''));
 const short = (sha) => String(sha).slice(0, 7);
 
@@ -35,10 +34,24 @@ export class Tasks {
   #mr(t) { return this.s.mergeRequests.find((m) => m.task === t.id); }
   #touch(t) { t.updatedAt = Date.now(); this.bus.store.save(); }
   depsMet(t) { return t.after.every((d) => this.s.tasks.find((x) => x.id === d)?.status === 'merged'); }
-  #mayTake(t, a) { return !t.assignee || t.assignee === a.name || t.assignee === a.team; }
+  #mayTake(t, a) {
+    if (t.team && a.team !== t.team && t.assignee !== a.name) return false; // a team's tasks stay in that team
+    return !t.assignee || t.assignee === a.name || t.assignee === a.team;
+  }
+  /** Leads and the head never get tasks offered automatically (they take one only when it names them). */
+  #autoOffer(a) { return this.bus.roleOf(a.name) === 'worker'; }
+  /** Who reviews and merges #t: its team's lead, or the head (also when the lead owns the task itself). */
+  reviewer(t) {
+    const r = this.bus.leadFor(t.team);
+    return r === t.owner ? this.bus.headName() : r;
+  }
+  #needBoss(who, t, what) {
+    const ok = this.bus.isBossOf(who, t.team) && (this.bus.isTop(who) || t.owner !== who); // a lead can't sign off its own task
+    if (!ok) throw new BusError(`only ${this.reviewer(t)}, the head or the human can ${what} #${t.id}`, 403);
+  }
 
-  add(who, { title, brief = '', files = [], check, after = [], assignee, timeout } = {}) {
-    if (!isBoss(who)) throw new BusError('only the lead or the human can add tasks', 403);
+  add(who, { title, brief = '', files = [], check, after = [], assignee, team, timeout } = {}) {
+    if (!this.bus.isBoss(who)) throw new BusError('only a lead, the head or the human can add tasks', 403);
     title = String(title ?? '').trim();
     if (!title) throw new BusError('task needs a title');
     check = String(check ?? '').trim();
@@ -47,15 +60,26 @@ export class Tasks {
     for (const d of deps) this.get(d);
     assignee = cleanName(assignee) || null;
     if (assignee && !NAME_RE.test(assignee)) throw new BusError(`bad assignee "${assignee}"`);
+    team = cleanName(team) || null;
+    if (team && !NAME_RE.test(team)) throw new BusError(`bad team "${team}"`);
+    if (!this.bus.isTop(who)) { // a team lead plans only for its own team
+      const mine = this.s.agents[cleanName(who)].team;
+      if (team && team !== mine) throw new BusError(`you lead team ${mine}, not ${team}`, 403);
+      const other = assignee && this.s.agents[assignee];
+      if (other && other.team !== mine) throw new BusError(`${assignee} is on team ${other.team}, not ${mine}`, 403);
+      if (assignee && !other && assignee in this.s.teams && assignee !== mine) throw new BusError(`you lead team ${mine}, not ${assignee}`, 403);
+      team = mine;
+      assignee ||= mine;
+    } else if (!team && assignee) team = this.s.agents[assignee]?.team ?? (assignee in this.s.teams ? assignee : null);
     const now = Date.now();
     const t = {
       id: ++this.s.taskSeq, title, brief: String(brief), files: [...new Set(files.map(normPath).filter(Boolean))],
-      check, after: deps, assignee, status: 'open', owner: null, offered: [],
+      check, after: deps, assignee, team, by: cleanName(who), status: 'open', owner: null, offered: [],
       timeout: Math.min(Math.max(1, Number(timeout) || 600), 3600), result: null, summary: '', branch: null, commit: null,
       createdAt: now, updatedAt: now,
     };
     this.s.tasks.push(t);
-    this.bus.log(`task #${t.id} added: ${t.title}${assignee ? ' for ' + assignee : ''}`);
+    this.bus.log(`task #${t.id} added by ${t.by}: ${t.title}${assignee ? ' for ' + assignee : ''}`);
     this.offer(t);
     this.#touch(t);
     return t;
@@ -69,7 +93,7 @@ export class Tasks {
     if (t.assignee && this.s.agents[t.assignee]) target = t.assignee; // a specific agent (busy or not)
     else {
       const free = agents
-        .filter((a) => !a.task && a.name !== LEAD && this.#mayTake(t, a) && !t.offered.includes(a.name))
+        .filter((a) => !a.task && this.#autoOffer(a) && this.#mayTake(t, a) && !t.offered.includes(a.name))
         .sort((x, y) => x.joinedAt - y.joinedAt);
       target = free[0]?.name ?? null;
     }
@@ -81,7 +105,7 @@ export class Tasks {
   /** After an agent frees up (join, merge, reassign), offer it the next task it may take. */
   offerNext(name) {
     const a = this.s.agents[name];
-    if (!a || a.task || a.name === LEAD) return;
+    if (!a || a.task || !this.#autoOffer(a)) return;
     const t = this.s.tasks.find((x) => x.status === 'open' && this.depsMet(x) && this.#mayTake(x, a) && !x.offered.includes(a.name));
     if (!t) return;
     t.offered.push(a.name);
@@ -105,13 +129,13 @@ export class Tasks {
       const wait = t.after.filter((d) => this.get(d).status !== 'merged').map((d) => '#' + d).join(',');
       throw new BusError(`#${t.id} waits on ${wait} — you'll be told when it's ready`, 409);
     }
-    if (!this.#mayTake(t, a)) throw new BusError(`#${t.id} is assigned to ${t.assignee}`, 403);
+    if (!this.#mayTake(t, a)) throw new BusError(`#${t.id} is ${t.assignee ? 'assigned to ' + t.assignee : 'for team ' + t.team}`, 403);
     if (a.task && a.task !== t.id) throw new BusError(`finish #${a.task} first (one task at a time)`, 409);
     if (t.files.length) {
       const r = this.bus.claim(who, t.files, `task #${t.id}`);
       if (!r.ok) {
         const c = r.conflicts.map((x) => `${x.path} (held by ${x.owner})`).join(', ');
-        throw new BusError(`can't claim ${c} — ask the owner or @lead`, 409);
+        throw new BusError(`can't claim ${c} — ask the owner or @${this.reviewer(t)}`, 409);
       }
     }
     Object.assign(t, { owner: who, status: 'in_progress', takenAt: Date.now(), checkRuns: 0, checkFails: 0 });
@@ -121,7 +145,7 @@ export class Tasks {
     return t;
   }
 
-  /** Runs the done-check in the owner's worktree (which must be committed). Pass -> merge request for the lead. */
+  /** Runs the done-check in the owner's worktree (which must be committed). Pass -> merge request for its reviewer. */
   async done(who, id, summary = '', { allowDirty = false, report = '' } = {}) {
     const t = this.get(id);
     if (t.owner !== who) throw new BusError(`#${t.id} is not yours`, 403);
@@ -163,9 +187,9 @@ export class Tasks {
     this.s.mergeRequests.push(mr);
     this.#report(t, a, notes);
     this.bus.log(`#${t.id} passed its check — merge request from ${who}`);
-    this.bus.notify(LEAD, `#${t.id} passed its check (${who}, branch ${t.branch ?? '?'})${t.summary ? ': ' + t.summary : ''} — review (bus report ${t.id}), then ask @you to approve`);
+    this.bus.notify(this.reviewer(t), `#${t.id} passed its check (${who}, branch ${t.branch ?? '?'})${t.summary ? ': ' + t.summary : ''} — review (bus report ${t.id}), then ask @you to approve`);
     this.#touch(t);
-    return { ok: true, mr };
+    return { ok: true, mr, reviewer: this.reviewer(t) };
   }
 
   /** Build the report from the bus's own records (no agent tokens), store it, append it to reports.md. Never sent to inboxes. */
@@ -184,10 +208,10 @@ export class Tasks {
     } catch (e) { this.bus.log(`couldn't append report for #${t.id}: ${e.message}`); }
   }
 
-  /** The stored report text: lead or human only. */
+  /** The stored report text: the task's lead, the head or the human. */
   report(who, id) {
-    if (!isBoss(who)) throw new BusError('only the lead or the human can read reports', 403);
     const t = this.get(id);
+    if (!this.bus.isBossOf(who, t.team)) throw new BusError(`only ${this.reviewer(t)}, the head or the human can read #${t.id}'s report`, 403);
     if (!t.report) throw new BusError(`#${t.id} has no report yet — one is written when its done-check passes`, 404);
     return t.report.text;
   }
@@ -201,12 +225,12 @@ export class Tasks {
     this.bus.log(`#${t.id} approved`);
     // Name the reviewed commit, not the branch: commits added to the branch after approval must not ride along.
     const what = t.commit ? `${short(t.commit)} (git merge ${short(t.commit)}; not the branch)` : (t.branch ?? 'its branch');
-    this.bus.notify(LEAD, `#${t.id} approved — merge ${what}, then: bus task merged ${t.id}`);
+    this.bus.notify(this.reviewer(t), `#${t.id} approved — merge ${what}, then: bus task merged ${t.id}`);
     this.#touch(t);
     return t;
   }
 
-  reject(who, id, why = '', { leadSaw = false } = {}) {
+  reject(who, id, why = '', { seen = [] } = {}) {
     if (who !== HUMAN) throw new BusError('only the human rejects merges', 403);
     const t = this.get(id);
     if (!['review', 'approved'].includes(t.status)) throw new BusError(`#${t.id} is ${t.status}, nothing to reject`, 409);
@@ -215,7 +239,8 @@ export class Tasks {
     Object.assign(this.#mr(t), { status: 'rejected', reason: why });
     this.bus.log(`#${t.id} rejected: ${why}`);
     this.bus.notify(t.owner, `#${t.id} rejected: ${why} — fix it, then: bus task done ${t.id}`);
-    if (!leadSaw) this.bus.notify(LEAD, `#${t.id} rejected: ${why}`);
+    const rev = this.reviewer(t);
+    if (!seen.includes(rev)) this.bus.notify(rev, `#${t.id} rejected: ${why}`);
     this.#touch(t);
     return t;
   }
@@ -226,18 +251,18 @@ export class Tasks {
    * force skips the git verification. Tasks with no recorded commit (not a git worktree) aren't verified.
    */
   merged(who, id, { force = false } = {}) {
-    if (!isBoss(who)) throw new BusError('only the lead marks tasks merged', 403);
     const t = this.get(id);
+    this.#needBoss(who, t, 'mark merged');
     if (t.status !== 'approved') throw new BusError(`#${t.id} is ${t.status} — it needs human approval first`, 409);
     if (!t.commit || force) {
       if (t.commit) this.bus.log(`#${t.id} marked merged with --force (${short(t.commit)} unverified)`);
       return Promise.resolve(this.#finishMerge(t));
     }
-    return this.#verifyMerge(t);
+    return this.#verifyMerge(t, who);
   }
 
-  async #verifyMerge(t) {
-    const dir = this.s.agents[LEAD]?.worktree || this.repo;
+  async #verifyMerge(t, who) {
+    const dir = this.s.agents[who]?.worktree || this.repo;
     const main = await mainBranch(dir);
     const r = await isAncestor(t.commit, main, dir);
     if (t.status !== 'approved') throw new BusError(`#${t.id} changed while verifying (${t.status})`, 409);
@@ -258,10 +283,11 @@ export class Tasks {
   }
 
   reassign(who, id, to) {
-    if (!isBoss(who)) throw new BusError('only the lead or the human can reassign', 403);
     const t = this.get(id);
+    this.#needBoss(who, t, 'reassign');
     to = cleanName(to);
     if (!this.s.agents[to]) throw new BusError(`unknown agent "${to}"`, 404);
+    if (!this.bus.isTop(who) && this.s.agents[to].team !== t.team) throw new BusError(`${to} is not on team ${t.team}`, 403);
     if (['merged', 'dropped'].includes(t.status)) throw new BusError(`#${t.id} is ${t.status}`, 409);
     const old = t.owner;
     this.#free(t);
@@ -275,8 +301,8 @@ export class Tasks {
   }
 
   drop(who, id) {
-    if (!isBoss(who)) throw new BusError('only the lead or the human can drop tasks', 403);
     const t = this.get(id);
+    this.#needBoss(who, t, 'drop');
     if (t.status === 'merged') throw new BusError(`#${t.id} is already merged`, 409);
     const old = t.owner;
     this.#free(t);
@@ -286,8 +312,9 @@ export class Tasks {
     this.bus.log(`#${t.id} dropped`);
     if (old) { this.bus.notify(old, `#${t.id} was dropped — stop work on it`); this.offerNext(old); }
     const blocked = this.s.tasks.filter((x) => x.after.includes(t.id) && !['merged', 'dropped'].includes(x.status));
-    if (blocked.length && who !== LEAD) {
-      this.bus.notify(LEAD, `#${t.id} dropped — ${blocked.map((x) => '#' + x.id).join(',')} depend on it and can never start; drop or re-plan them`);
+    const rev = this.reviewer(t);
+    if (blocked.length && who !== rev) {
+      this.bus.notify(rev, `#${t.id} dropped — ${blocked.map((x) => '#' + x.id).join(',')} depend on it and can never start; drop or re-plan them`);
     } else if (blocked.length) this.bus.log(`#${t.id} dropped; ${blocked.map((x) => '#' + x.id).join(',')} now blocked`);
     this.#touch(t);
     return t;
@@ -301,14 +328,14 @@ export class Tasks {
     if (a.task === t.id) a.task = null;
   }
 
-  /** "@lead approve #4" / "@lead reject #4 reason" from the human in chat. */
+  /** "approve #4" / "@fe-lead reject #4 reason" from the human in chat (any one @mention prefix). */
   #chatApproval(m) {
     // Whole-message commands only, so "don't approve #3" or "I'll approve #3 later" never approve anything.
-    const ap = /^\s*(?:@lead[\s,:]+)?approve\s+#(\d+)\s*[.!]?\s*$/i.exec(m.text);
-    const rj = /^\s*(?:@lead[\s,:]+)?reject\s+#(\d+)\s*[:-]?\s*(.*)$/is.exec(m.text);
+    const ap = /^\s*(?:@[a-z0-9][\w-]*[\s,:]+)?approve\s+#(\d+)\s*[.!]?\s*$/i.exec(m.text);
+    const rj = /^\s*(?:@[a-z0-9][\w-]*[\s,:]+)?reject\s+#(\d+)\s*[:-]?\s*(.*)$/is.exec(m.text);
     try {
       if (ap) this.approve(HUMAN, ap[1]);
-      else if (rj) this.reject(HUMAN, rj[1], rj[2], { leadSaw: m.to === LEAD || m.mentions.includes(LEAD) });
+      else if (rj) this.reject(HUMAN, rj[1], rj[2], { seen: [m.to, ...m.mentions].filter(Boolean) });
     } catch (e) { this.bus.notify(HUMAN, `couldn't apply "${(ap || rj)[0]}": ${e.message}`); }
   }
 }

@@ -12,7 +12,7 @@ const TRUNC = 200;
 const HELP = `bus — local agent chat, claims and tasks
   bus serve [--port N] [--data FILE]    start server (default 127.0.0.1:${DEFAULT_PORT}, .bus/state.json)
   bus init [project]                    add hooks + agent rules to a project
-  bus join                              register (BUS_AGENT, BUS_TEAM env)
+  bus join                              register (BUS_AGENT, BUS_TEAM, BUS_ROLE=lead|head env)
   bus who                               list agents
   bus send [#chan|@agent|@team] text    post (default: your team channel)
   bus read                              unread messages addressed to you
@@ -20,21 +20,21 @@ const HELP = `bus — local agent chat, claims and tasks
   bus show <id>                         full text of a message
   bus log [#chan] [n]                   read a channel (no #chan: your DMs)
   bus claim <paths...> [-m why]         claim files / dirs/ / globs
-  bus release <paths...> | --all        [--of agent: human, or lead if agent inactive]
-  bus request <hot-file> "change"       ask the lead to change a hot file
-  bus request done|decline <id> ["why"] (lead)
-  bus hot add|rm <paths...> | list      lead-owned shared files            (lead/human)
-  bus iface add <path> --teams a,b | rm <path> | list                     (lead/human)
+  bus release <paths...> | --all        [--of agent: human, or its lead/head if agent inactive]
+  bus request <hot-file> "change"       ask the head to change a hot file
+  bus request done|decline <id> ["why"] (head)
+  bus hot add|rm <paths...> | list      head-owned shared files            (head/human)
+  bus iface add <path> --teams a,b | rm <path> | list                     (head/human)
   bus claims [--mine]
   bus check <path>                      is a file free for you to edit?
   bus pending                           count of unread messages
-  bus task add "title" --files a,b/ --check "cmd" [--after 3,4] [--for agent|team]
-               [--brief "text" | --brief-file f] [--timeout secs]          (lead)
+  bus task add "title" --files a,b/ --check "cmd" [--after 3,4] [--for agent|team] [--team t]
+               [--brief "text" | --brief-file f] [--timeout secs]          (lead: own team; head)
   bus task list [--mine] | show <id> | take <id>
   bus task done <id> ["summary"] [--report "≤3 lines"] [--allow-dirty]  commit first; runs the done-check -> merge request
-  bus report <id>                       the task's report (lead/human)
-  bus task merged <id> [--force]        (lead) after merging; verifies the commit is in main
-  bus task reassign <id> <agent> | drop <id>                    (lead/human)
+  bus report <id>                       the task's report (its lead/head/human)
+  bus task merged <id> [--force]        (its lead/head) after merging; verifies the commit is in main
+  bus task reassign <id> <agent> | drop <id>                    (its lead/head/human)
   bus approve <id> | bus reject <id> "why"                      (human)
   bus auth reset <agent>                drop an agent's token (BUS_AUTH=1)  (human)
   bus dashboard [--no-open]             print + open the dashboard link with your token  (human)`;
@@ -95,13 +95,13 @@ const commands = {
       if (!fs.existsSync(ignore)) fs.writeFileSync(ignore, '*\n');
       fs.writeFileSync(file, token + '\n', { mode: 0o600 });
     }
-    console.log(`joined as ${agent.name} (team ${agent.team})`);
+    console.log(`joined as ${agent.name} (team ${agent.team}${agent.role && agent.role !== 'worker' ? ', ' + agent.role : ''})`);
   },
 
   async who() {
     const { agents } = await request('GET', '/api/who');
     if (!agents.length) return console.log('no agents');
-    for (const a of agents) console.log(`${a.name} ${a.team} task:${a.task ?? '-'} seen:${ago(a.lastSeen)}`);
+    for (const a of agents) console.log(`${a.name} ${a.team}${a.role && a.role !== 'worker' ? ' ' + a.role : ''} task:${a.task ?? '-'} seen:${ago(a.lastSeen)}`);
   },
 
   async send(args) {
@@ -134,7 +134,7 @@ const commands = {
     if (r.ok) return console.log(`claimed ${r.claimed.join(' ')}`);
     for (const c of r.conflicts) {
       console.log(c.hot
-        ? `blocked: ${c.path} overlaps hot file ${c.claim} (lead) — ask: bus request ${c.claim} "..."`
+        ? `blocked: ${c.path} overlaps hot file ${c.claim} (${c.owner}) — ask: bus request ${c.claim} "..."`
         : `blocked: ${c.path} overlaps ${c.claim} held by ${c.owner} — ask: bus send @${c.owner} "..."`);
     }
     process.exitCode = 1;
@@ -186,7 +186,7 @@ const commands = {
     }
     const [file, ...text] = args;
     const { request: r } = await request('POST', '/api/request', { body: { file, text: text.join(' ') } });
-    console.log(`sent request r${r.id} to @lead`);
+    console.log(`sent request r${r.id} to the head`);
   },
 
   async iface([sub, p, ...rest]) {
@@ -204,7 +204,7 @@ const commands = {
 
   async approve([id]) {
     const { task: t } = await request('POST', '/api/approve', { body: { id } });
-    console.log(`approved #${t.id} — @lead will merge it`);
+    console.log(`approved #${t.id} — its lead will merge it`);
   },
 
   async reject([id, ...why]) {
@@ -260,7 +260,7 @@ const commands = {
 const csv = (v) => (v ? String(v).split(',').map((s) => s.trim()).filter(Boolean) : []);
 
 function taskLine(t) {
-  const who = t.owner || (t.assignee ? '→' + t.assignee : '-');
+  const who = (t.owner || (t.assignee ? '→' + t.assignee : '-')) + (t.team && t.team !== t.assignee ? ' [' + t.team + ']' : '');
   const deps = t.after.length ? ` [after ${t.after.map((d) => '#' + d).join(',')}]` : '';
   return `#${t.id} ${t.status} ${who}: ${t.title}${deps}`;
 }
@@ -282,6 +282,7 @@ const taskCommands = {
       check: takeFlag(args, '--check', true),
       after: csv(takeFlag(args, '--after', true)),
       assignee: takeFlag(args, '--for', true),
+      team: takeFlag(args, '--team', true),
       brief: takeFlag(args, '--brief', true) || '',
       timeout: takeFlag(args, '--timeout', true),
     };
@@ -311,7 +312,7 @@ const taskCommands = {
     const report = takeFlag(args, '--report', true) || '';
     const [id, ...summary] = args;
     const r = await request('POST', '/api/task/done', { body: { id, summary: summary.join(' '), allowDirty, report }, headers: { 'x-bus-cwd': gitRoot() } });
-    if (r.ok) return console.log(`check passed — #${r.mr.task} sent to @lead for review`);
+    if (r.ok) return console.log(`check passed — #${r.mr.task} sent to ${r.reviewer ?? 'its lead'} for review`);
     console.log(`check failed (exit ${r.code}) — fix and rerun bus task done ${id}\n${r.output}`);
     process.exitCode = 1;
   },

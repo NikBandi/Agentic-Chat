@@ -35,7 +35,7 @@ describe('bus init', () => {
 
   test('agent rules: commit before done, lead merges the sha plainly, block stays ~10 lines', () => {
     assert.match(AGENT_RULES, /^- Commit your work on your branch before bus task done\.$/m);
-    assert.match(AGENT_RULES, /^- Lead: Merge with plain `git merge <sha>` — no squash or rebase\.$/m);
+    assert.match(AGENT_RULES, /^- Leads: .*Merge with plain `git merge <sha>` — no squash or rebase\.$/m);
     assert.ok(AGENT_RULES.split('\n').length <= 12, 'rules block (incl. markers) must stay short');
   });
 

@@ -3,7 +3,9 @@ import { EventEmitter } from 'node:events';
 import { normPath, overlaps, covers } from './paths.js';
 
 export const HUMAN = 'you';
-export const LEAD = 'lead';
+export const LEAD = 'lead'; // legacy single-lead name: acts as the head
+export const HEAD = 'head';
+export const ROLES = ['worker', 'lead', 'head'];
 const NAME_RE = /^[a-z0-9][a-z0-9_-]{0,39}$/;
 const MENTION_RE = /(?<![\w@])@([A-Za-z0-9][\w-]*)/g;
 export const INBOX_CAP = 30;
@@ -22,26 +24,72 @@ export class Bus extends EventEmitter {
     this.s = store.state;
   }
 
-  // ---- agents / teams -------------------------------------------------
+  // ---- agents / teams / roles -----------------------------------------
+
+  /** Role of a name: 'head' | 'lead' (of its team) | 'worker' | 'human'. The legacy agent "lead" is the head. */
+  roleOf(name) {
+    name = cleanName(name);
+    if (name === HUMAN) return 'human';
+    const a = this.s.agents[name];
+    if (a?.role) return a.role;
+    return name === LEAD ? HEAD : 'worker';
+  }
+
+  /** The head agent's name (or the legacy "lead"), whether or not it has joined. */
+  headName() {
+    return Object.values(this.s.agents).find((a) => a.role === HEAD)?.name ?? LEAD;
+  }
+
+  /** The lead of `team`, or the head when the team has no lead. */
+  leadFor(team) {
+    return (team && Object.values(this.s.agents).find((a) => a.role === 'lead' && a.team === team)?.name) || this.headName();
+  }
+
+  /** Human or head: shared files, interfaces, requests, any team's tasks. */
+  isTop(who) { const r = this.roleOf(who); return r === 'human' || r === HEAD; }
+
+  /** May `who` manage work in `team`? Human, head, or that team's lead. */
+  isBossOf(who, team) {
+    if (this.isTop(who)) return true;
+    return this.roleOf(who) === 'lead' && !!team && this.s.agents[cleanName(who)]?.team === team;
+  }
+
+  /** Any lead-like role (human, head, team lead). */
+  isBoss(who) { return this.roleOf(who) !== 'worker'; }
+
+  #role(name, role, team) {
+    role = cleanName(role) || (name === LEAD ? HEAD : 'worker');
+    if (!ROLES.includes(role)) throw new BusError(`bad role "${role}" (BUS_ROLE: worker, lead or head)`);
+    for (const o of Object.values(this.s.agents)) {
+      if (o.name === name) continue;
+      if (role === HEAD && this.roleOf(o.name) === HEAD) throw new BusError(`${o.name} is already the head`, 409);
+      if (role === 'lead' && o.role === 'lead' && o.team === team) throw new BusError(`${o.name} already leads team ${team}`, 409);
+    }
+    if (role === 'lead' && !team) throw new BusError('a lead needs a team — set BUS_TEAM');
+    return role;
+  }
 
   /** Register or refresh an agent. Any call from an agent counts as activity. */
-  touch(name, team, worktree) {
+  touch(name, team, worktree, role = '') {
     name = cleanName(name);
     if (!name || name === HUMAN) return null;
     if (!NAME_RE.test(name) || name === 'bus') throw new BusError(`bad agent name "${name}" (use a-z 0-9 _ -; "bus" is reserved)`);
-    team = cleanName(team) || (name === LEAD ? LEAD : '');
+    team = cleanName(team) || (name === LEAD || cleanName(role) === HEAD ? name : '');
     if (team && !NAME_RE.test(team)) throw new BusError(`bad team name "${team}"`);
     const now = Date.now();
     let a = this.s.agents[name];
     if (!a) {
       if (!team) throw new BusError(`unknown agent "${name}" — set BUS_TEAM and run: bus join`);
       // cursor 0 + joinedSeq: DMs sent before joining (e.g. task offers) are delivered; older mentions are not.
-      a = this.s.agents[name] = { name, team, worktree: worktree || null, joinedAt: now, lastSeen: now, cursor: 0, joinedSeq: this.s.seq, task: null };
+      const r = this.#role(name, role, team);
+      a = this.s.agents[name] = { name, team, role: r, worktree: worktree || null, joinedAt: now, lastSeen: now, cursor: 0, joinedSeq: this.s.seq, task: null };
       this.#setTeam(name, null, team);
-      this.log(`${name} joined team ${team}`);
+      this.log(`${name} joined team ${team}${r === 'worker' ? '' : ' as ' + r}`);
       this.store.save();
       this.emit('join', a);
     } else {
+      if (role && cleanName(role) !== this.roleOf(name)) throw new BusError(`${name} is registered as ${this.roleOf(name)}, not ${cleanName(role)} — roles are fixed at join`, 409);
+      if (team && team !== a.team && a.role === 'lead') throw new BusError(`${name} leads team ${a.team} — a lead can't change team`, 409);
       if (team && team !== a.team) { this.#setTeam(name, a.team, team); this.log(`${name} moved ${a.team} -> ${team}`); a.team = team; }
       if (worktree) a.worktree = worktree;
       a.lastSeen = now;
@@ -60,7 +108,7 @@ export class Bus extends EventEmitter {
   }
 
   who() {
-    return Object.values(this.s.agents).map(({ name, team, task, lastSeen, worktree }) => ({ name, team, task, lastSeen, worktree }));
+    return Object.values(this.s.agents).map(({ name, team, task, lastSeen, worktree }) => ({ name, team, role: this.roleOf(name), task, lastSeen, worktree }));
   }
 
   // ---- messages -------------------------------------------------------
@@ -204,8 +252,8 @@ export class Bus extends EventEmitter {
       for (const c of this.s.claims) {
         if (c.agent !== a.name && overlaps(p, c.path)) conflicts.push({ path: p, owner: c.agent, claim: c.path });
       }
-      if (a.name !== LEAD) {
-        for (const h of this.s.hotFiles) if (overlaps(p, h)) conflicts.push({ path: p, owner: LEAD, claim: h, hot: true });
+      if (this.roleOf(a.name) !== HEAD) {
+        for (const h of this.s.hotFiles) if (overlaps(p, h)) conflicts.push({ path: p, owner: this.headName(), claim: h, hot: true });
       }
     }
     if (conflicts.length) return { ok: false, conflicts };
@@ -246,9 +294,9 @@ export class Bus extends EventEmitter {
     const f = normPath(file);
     const other = this.s.claims.find((c) => c.agent !== me && covers(c.path, f));
     if (other) return { free: false, owner: other.agent, claim: other.path };
-    if (me !== LEAD) {
+    if (this.roleOf(me) !== HEAD) {
       const hot = this.s.hotFiles.find((h) => covers(h, f));
-      if (hot) return { free: false, owner: LEAD, claim: hot, hot: true };
+      if (hot) return { free: false, owner: this.headName(), claim: hot, hot: true };
     }
     const iface = this.s.interfaces.find((i) => covers(i.path, f));
     const a = this.s.agents[me];
@@ -259,16 +307,16 @@ export class Bus extends EventEmitter {
     return { free: true, mine: this.s.claims.some((c) => c.agent === me && covers(c.path, f)), ...(iface && { iface: iface.path }) };
   }
 
-  /** Releasing another agent's claims: the human always, the lead only for inactive agents. */
+  /** Releasing another agent's claims: the human always; the head, or the agent's team lead, only for inactive agents. */
   releaseOf(who, target, paths, all = false) {
     const t = this.#agent(target);
-    if (who !== HUMAN && !(who === LEAD && t.inactive)) throw new BusError('only the human, or the lead for an inactive agent, can release its claims', 403);
+    if (who !== HUMAN && !(t.inactive && this.isBossOf(who, t.team) && who !== t.name)) throw new BusError("only the human, or the head or the agent's team lead for an inactive agent, can release its claims", 403);
     return this.release(t.name, paths, all);
   }
 
   // ---- hot files, change requests, interfaces (DESIGN.md §5) ---------
 
-  #boss(who, what) { if (who !== LEAD && who !== HUMAN) throw new BusError(`only the lead or the human can ${what}`, 403); }
+  #boss(who, what) { if (!this.isTop(who)) throw new BusError(`only the head or the human can ${what}`, 403); }
 
   hotAdd(who, paths) {
     this.#boss(who, 'manage hot files');
@@ -287,7 +335,7 @@ export class Bus extends EventEmitter {
     return this.s.hotFiles;
   }
 
-  /** A worker asks the lead to change a hot file. */
+  /** An agent asks the head to change a hot file. */
   request(who, file, text) {
     const a = this.#agent(who);
     file = normPath(file);
@@ -297,7 +345,7 @@ export class Bus extends EventEmitter {
     const r = { id: (this.s.requests.at(-1)?.id ?? 0) + 1, file, agent: a.name, text, status: 'open', reason: '', ts: Date.now() };
     this.s.requests.push(r);
     this.log(`${a.name} requested change to ${file}`);
-    this.notify(LEAD, `request r${r.id} from ${a.name} — ${file}: ${text} — bus request done|decline ${r.id} ["why"]`);
+    this.notify(this.headName(), `request r${r.id} from ${a.name} — ${file}: ${text} — bus request done|decline ${r.id} ["why"]`);
     return r;
   }
 
@@ -339,17 +387,18 @@ export class Bus extends EventEmitter {
 
   // ---- inactivity ------------------------------------------------------
 
-  /** Flag agents silent longer than `ms` (skipping `busy` names, e.g. blocked in bus wait); tell the lead once. */
+  /** Flag agents silent longer than `ms` (skipping `busy` names, e.g. blocked in bus wait); tell its lead once. */
   sweep(ms, busy = new Set(), now = Date.now()) {
     const flagged = [];
     for (const a of Object.values(this.s.agents)) {
-      if (a.inactive || a.name === LEAD || busy.has(a.name) || now - a.lastSeen < ms) continue;
+      if (a.inactive || this.roleOf(a.name) === HEAD || busy.has(a.name) || now - a.lastSeen < ms) continue;
       a.inactive = true;
       flagged.push(a.name);
       const mins = Math.round((now - a.lastSeen) / 60000);
       this.log(`${a.name} inactive (${mins}m)`);
       const fix = a.task ? `bus task reassign ${a.task} <agent>` : `bus release --of ${a.name} --all`;
-      this.notify(LEAD, `${a.name} inactive ${mins}m${a.task ? ' (task #' + a.task + ')' : ''} — ${fix}`);
+      const boss = a.role === 'lead' ? this.headName() : this.leadFor(a.team);
+      this.notify(boss, `${a.name} inactive ${mins}m${a.task ? ' (task #' + a.task + ')' : ''} — ${fix}`);
     }
     if (flagged.length) this.store.save();
     return flagged;

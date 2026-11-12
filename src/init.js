@@ -11,13 +11,13 @@ const END = '<!-- /agent-bus -->';
 
 export const AGENT_RULES = `${START}
 ## Agent bus (applies only when BUS_AGENT is set)
-- You are $BUS_AGENT on team $BUS_TEAM. Coordinate only via the \`bus\` CLI (\`bus help\`).
+- You are $BUS_AGENT on team $BUS_TEAM (role $BUS_ROLE; unset = worker). Coordinate only via the \`bus\` CLI (\`bus help\`).
 - Start: \`bus join\`, \`bus task list --mine\`, \`bus task take <id>\`. The task brief is your full context.
 - Edit only files your task claims. If an edit is blocked, ask the owner (\`bus send @owner "..."\`); never work around it with shell writes.
-- Hot files (package.json, lockfiles, shared types, global config): \`bus request <file> "change"\` instead of editing.
+- Hot files (package.json, lockfiles, shared types, global config) belong to the head: \`bus request <file> "change"\` instead of editing.
 - When a hook notice says something is waiting, run \`bus read\`. Never poll. Blocked on someone? \`bus wait\`.
 - Commit your work on your branch before bus task done.
-- Lead: Merge with plain \`git merge <sha>\` — no squash or rebase.
+- Leads: plan and review only your own team's tasks; contract and hot-file questions go to @head. Merge with plain \`git merge <sha>\` — no squash or rebase.
 - Done: \`bus task done <id> "summary"\` runs the done-check; fix failures and retry. On bus task done, include --report with up to 3 lines.
 - Keep messages short; @mention only who must act. Full text of a truncated message: \`bus show <id>\`.
 ${END}`;

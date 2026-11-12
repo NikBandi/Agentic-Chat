@@ -524,7 +524,7 @@ function taskCard(t) {
 }
 function renderBoard() {
   const board = $('board');
-  if (!S.tasks.length) { fill(board, h('p', { class: 'empty' }, 'No tasks yet — the lead adds them with bus task add.')); return; }
+  if (!S.tasks.length) { fill(board, h('p', { class: 'empty' }, 'No tasks yet — the head or a team lead adds them with bus task add.')); return; }
   const cols = ['open', 'in_progress', 'review', 'approved', 'merged'].map((st) => {
     let ts = S.tasks.filter((t) => t.status === st);
     const col = h('div', { class: 'col' }, h('h3', {}, STATUS_LABEL[st], h('span', { class: 'soft' }, '· ' + ts.length)));
@@ -573,7 +573,7 @@ function agentCard(a, state) {
   const step = stepOf(t);
   const lm = lastMessage(a);
   const r = t && t.result;
-  const role = a.name === 'lead' ? 'lead' : 'worker';
+  const role = a.role || (a.name === 'lead' ? 'head' : 'worker');
   const card = h('button', { class: 'acard' + (state === 'inactive' ? ' dim' : ''), id: 'agent-' + a.name, type: 'button', onclick: () => openDrawer('agent', a.name), 'aria-label': `${a.name}, ${TAB_LABEL[state]}. Open history` },
     h('span', { class: 'aname' }, h('span', { class: 'dot a-' + state, 'aria-hidden': 'true' }), a.name, h('span', { class: 'role' }, role + ' · ' + (a.team || '-') + ' · ' + (state === 'waiting' ? 'in bus wait' : TAB_LABEL[state].toLowerCase()))),
     t ? h('span', { style: 'display:block;margin-top:4px;overflow-wrap:anywhere' }, '#' + t.id + ' ' + t.title) : null,
@@ -622,7 +622,7 @@ function renderClaims() {
       cs.map((c) => h('div', { class: 'claim' }, h('code', {}, c.path), c.why ? h('span', { class: 'soft' }, c.why) : null))))
       : h('p', { class: 'empty' }, 'No claims.'),
     (hot.length || ifs.length || reqs.length) ? [h('h3', { class: 'subtle-h' }, 'Hot files · interfaces · requests'),
-      hot.map((p) => h('div', { class: 'claim' }, h('code', {}, p), h('span', { class: 'soft' }, 'hot · lead'))),
+      hot.map((p) => h('div', { class: 'claim' }, h('code', {}, p), h('span', { class: 'soft' }, 'hot · head'))),
       ifs.map((i) => h('div', { class: 'claim' }, h('code', {}, i.path), h('span', { class: 'soft' }, 'interface · ' + i.teams.join(', ')))),
       reqs.map((r) => h('div', { class: 'claim' }, h('code', {}, r.file), h('span', { class: 'soft' }, 'r' + r.id + ' ' + r.agent + ': ' + r.text)))] : null);
 }
@@ -811,7 +811,7 @@ function agentDetail(a) {
   return [
     h('h2', { class: 'dt', id: 'drawerTitle' }, a.name),
     h('div', { class: 'meta' }, h('span', { class: 'chip' }, h('span', { class: 'dot a-' + state, 'aria-hidden': 'true' }), TAB_LABEL[state]),
-      h('span', {}, (a.name === 'lead' ? 'lead' : 'worker') + ' · team ' + (a.team || '-')), h('span', {}, 'seen ' + ago(a.lastSeen)),
+      h('span', {}, (a.role || (a.name === 'lead' ? 'head' : 'worker')) + ' · team ' + (a.team || '-')), h('span', {}, 'seen ' + ago(a.lastSeen)),
       a.worktree ? h('span', { class: 'mono', style: 'overflow-wrap:anywhere' }, a.worktree) : null),
     h('section', {}, h('h3', {}, 'Tasks'), took.length ? took.slice().reverse().map((t) => h('div', { class: 'hist' },
       h('div', { class: 'mr-head' }, h('button', { class: 'btn link', type: 'button', onclick: () => openDrawer('task', t.id) }, '#' + t.id + ' ' + t.title), chip(t.status)),
