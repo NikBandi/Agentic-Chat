@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { Bus, BusError, HUMAN, cleanName } from './bus.js';
 import { Store } from './store.js';
 import { Tasks } from './tasks.js';
+import { Spawner } from './spawn.js';
 
 export const DEFAULT_PORT = 4477;
 const MAX_BODY = 256 * 1024;
@@ -19,11 +20,14 @@ export function createServer({
   repoDir = process.cwd(), // merges are verified here when the merger's worktree is unknown
   auth = process.env.BUS_AUTH === '1', // per-agent tokens + human token (off by default)
   humanToken = crypto.randomBytes(24).toString('base64url'), // `bus serve` writes it to ~/.agentic-chat/<port>.human.token
+  launcher, // tests: replaces starting real `claude -p` workers
+  env = process.env,
 } = {}) {
   const store = new Store(dataFile);
   const bus = new Bus(store);
   const tasks = new Tasks(bus, { repo: repoDir, reportsFile: dataFile ? path.join(path.dirname(dataFile), 'reports.md') : null });
   bus.s.tokens ??= {}; // agent -> sha256(token); never served
+  const spawner = new Spawner(bus, tasks, { repo: repoDir, dataDir: dataFile ? path.dirname(dataFile) : null, env, port, ...(launcher && { launcher }) });
 
   /** BUS_AUTH: an agent with a token must present it; an agent without one may only join (and gets one). */
   function authenticate(who, req, isJoin) {
@@ -121,6 +125,9 @@ export function createServer({
     'POST /api/task/merged': async ({ who, body }) => ({ task: await tasks.merged(who, body.id, { force: !!body.force }) }),
     'POST /api/task/reassign': ({ who, body }) => ({ task: tasks.reassign(who, body.id, body.to) }),
     'POST /api/task/drop': ({ who, body }) => ({ task: tasks.drop(who, body.id) }),
+    'POST /api/spawn': ({ who, body }) => ({ worker: spawner.request(who, body.id), running: spawner.running().length, max: spawner.max }),
+    'POST /api/spawn/stop': ({ who, body }) => ({ worker: spawner.stop(who, body.name) }),
+    'GET /api/workers': () => ({ workers: spawner.list(), running: spawner.running().length, max: spawner.max }),
     'POST /api/approve': ({ who, body }) => ({ task: tasks.approve(who, body.id) }),
     'POST /api/reject': ({ who, body }) => ({ task: tasks.reject(who, body.id, body.why) }),
   };
@@ -177,9 +184,9 @@ export function createServer({
   server.headersTimeout = 30_000;
 
   return {
-    bus, tasks, store, server, humanToken,
+    bus, tasks, spawner, store, server, humanToken,
     listen: () => new Promise((ok, fail) => { server.once('error', fail); server.listen(port, host, () => ok(server.address().port)); }),
-    close: () => new Promise((ok) => { clearInterval(heartbeat); clearInterval(sweeper); clearTimeout(changeTimer); for (const r of sse) r.end(); store.flush(); server.closeAllConnections?.(); server.close(() => ok()); }),
+    close: () => new Promise((ok) => { spawner.close(); clearInterval(heartbeat); clearInterval(sweeper); clearTimeout(changeTimer); for (const r of sse) r.end(); store.flush(); server.closeAllConnections?.(); server.close(() => ok()); }),
   };
 }
 

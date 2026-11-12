@@ -49,6 +49,22 @@ BUS_AGENT=fe-1 BUS_TEAM=frontend claude                      # workers: no BUS_R
 - Roles are fixed at join. There can be only one head, and one lead per team. The shell guard blocks changing `BUS_ROLE`. The pre-commit merge exemption covers any `BUS_ROLE=lead|head` session.
 - Without `BUS_ROLE`, an agent named `lead` is the head, so single-lead setups work unchanged.
 
+### Lead-spawned workers (`bus spawn`)
+
+A lead doesn't need you to open worker sessions. It decides how many tasks can run in parallel and starts one worker per task:
+
+```sh
+bus spawn 3 4 5      # lead (own team's tasks), head, or human
+bus workers          # 3/4 running, plus each worker's status
+bus workers stop frontend-2
+```
+
+- **Each worker gets its own git worktree** next to the repo (`<repo>-frontend-1`, branch `frontend-1`) and a headless `claude -p` session. Its prompt holds only the task: join, take the task (the brief is its full context), test first, commit, `bus task done --report`. Hooks come from `--settings .bus/worker-settings.json`, so the worktree stays clean, and `ECC_HOOK_PROFILE=minimal` is set.
+- **Token limits:** at most `BUS_MAX_WORKERS` (default **4**, max 16) run at once across the whole bus. Extra spawns queue and start as slots free up, and a task waiting on dependencies doesn't take a slot. A worker **exits as soon as its check passes**, so no session sits idle. Optional: `BUS_WORKER_MODEL` (e.g. `sonnet`) and `BUS_WORKER_BUDGET` (USD per run, `--max-budget-usd`).
+- **Rejected?** The same worker is re-spawned in the same worktree, with the reason in its prompt. If a worker exits without handing its task in, its lead gets one notice with the log path (`.bus/workers/<name>.log`).
+- Spawned workers are never offered other tasks and are not flagged inactive after exiting. Merging and approval work exactly as before.
+- **Permissions:** workers run with `--permission-mode bypassPermissions` (they're unattended), still behind the bus edit guard, shell guard and pre-commit guard. Set `BUS_WORKER_PERMISSION=acceptEdits` for a stricter mode (shell commands may then be refused). Starting the command: `BUS_CLAUDE` (default `claude`).
+
 ## How messages reach agents
 
 - `bus send @bob ...` is a DM. `bus send @frontend ...` posts to `#frontend` and mentions the team. `bus send #general ...` is a plain channel post.
