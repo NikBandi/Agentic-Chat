@@ -2,6 +2,8 @@
 // Built server-side when a done-check passes; stored on the task, appended to .bus/reports.md, never sent to inboxes.
 import { BusError, LEAD } from './bus.js';
 
+const roleLabel = (a) => a.role ?? (a.name === LEAD ? 'head' : 'worker');
+
 export const REPORT_MAX_LINES = 3;
 export const REPORT_MAX_CHARS = 160;
 
@@ -51,7 +53,7 @@ export function buildReport({ task: t, agent, claims, messages, isFor, notes = [
   const runs = t.checkRuns ?? 1;
   const fails = t.checkFails ?? 0;
   return {
-    title: `#${t.id} ${t.title} — ${agent.name} (${agent.name === LEAD ? 'lead' : 'worker'}, team ${agent.team ?? '-'})`,
+    title: `#${t.id} ${t.title} — ${agent.name} (${roleLabel(agent)}, team ${agent.team ?? '-'})`,
     fields: [
       ['time', `${fmtDuration(now - since)} (${stamp(since)} → ${stamp(now)})`],
       ['files claimed', claims.length ? claims.join(', ') : 'none'],

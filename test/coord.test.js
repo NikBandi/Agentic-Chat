@@ -20,7 +20,7 @@ beforeEach(() => {
 
 describe('hot files', () => {
   test('only lead/human manage them', () => {
-    assert.throws(() => bus.hotAdd('fe1', ['package.json']), /only the lead/);
+    assert.throws(() => bus.hotAdd('fe1', ['package.json']), /only the head or the human/);
     assert.deepEqual(bus.hotAdd('lead', ['package.json', './package.json']), ['package.json']);
     assert.deepEqual(bus.hotRm('you', ['package.json']), []);
   });
@@ -43,7 +43,7 @@ describe('change requests', () => {
   test('request -> lead DM -> done/decline -> requester DM', () => {
     const r = bus.request('fe1', 'package.json', 'add zod ^3');
     assert.match(inbox('lead')[0], /request r1 from fe1 — package\.json: add zod \^3/);
-    assert.throws(() => bus.resolveRequest('fe1', r.id, 'done'), /only the lead/);
+    assert.throws(() => bus.resolveRequest('fe1', r.id, 'done'), /only the head or the human/);
     bus.resolveRequest('lead', 'r1', 'decline', 'use valibot');
     assert.match(inbox('fe1')[0], /r1 \(package\.json\) declined: use valibot/);
     assert.throws(() => bus.resolveRequest('lead', 1, 'done'), /already declined/);

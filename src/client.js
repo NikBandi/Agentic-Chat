@@ -29,6 +29,7 @@ export function identity(extra = {}) {
   const h = {};
   if (process.env.BUS_AGENT) h['x-bus-agent'] = encodeURIComponent(process.env.BUS_AGENT);
   if (process.env.BUS_TEAM) h['x-bus-team'] = encodeURIComponent(process.env.BUS_TEAM);
+  if (process.env.BUS_AGENT && process.env.BUS_ROLE) h['x-bus-role'] = encodeURIComponent(process.env.BUS_ROLE);
   const token = findToken();
   if (token) h['x-bus-token'] = encodeURIComponent(token);
   if (!process.env.BUS_AGENT) { // the human: prove it with the token bus serve wrote outside the repo

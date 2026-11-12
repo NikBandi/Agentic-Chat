@@ -16,7 +16,7 @@ const MAX_WAIT_S = 3600;
 export function createServer({
   dataFile = null, port = DEFAULT_PORT, host = '127.0.0.1',
   inactiveMs = (Number(process.env.BUS_INACTIVE_MIN) || 30) * 60_000,
-  repoDir = process.cwd(), // merges are verified here when the lead's worktree is unknown
+  repoDir = process.cwd(), // merges are verified here when the merger's worktree is unknown
   auth = process.env.BUS_AUTH === '1', // per-agent tokens + human token (off by default)
   humanToken = crypto.randomBytes(24).toString('base64url'), // `bus serve` writes it to ~/.agentic-chat/<port>.human.token
 } = {}) {
@@ -164,7 +164,7 @@ export function createServer({
       const who = cleanName(hdr(req, 'x-bus-agent')) || HUMAN; // naming yourself "you" is the same as no name
       if (who === HUMAN) requireHuman(hdr(req, 'x-bus-human'));
       authenticate(who, req, url.pathname === '/api/join'); // before touch(): unproven agents aren't registered
-      const me = who === HUMAN ? null : bus.touch(who, hdr(req, 'x-bus-team'), hdr(req, 'x-bus-cwd'));
+      const me = who === HUMAN ? null : bus.touch(who, hdr(req, 'x-bus-team'), hdr(req, 'x-bus-cwd'), hdr(req, 'x-bus-role'));
       const body = req.method === 'POST' ? await readBody(req) : {};
       const out = await route({ who, me, body, q: url.searchParams, req, res });
       if (out !== null && !res.writableEnded) send(res, 200, out);

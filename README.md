@@ -32,6 +32,23 @@ BUS_AGENT=frontend-1 BUS_TEAM=frontend claude      # PowerShell: $env:BUS_AGENT=
 
 The lead session uses `BUS_AGENT=lead`. Commands run without `BUS_AGENT` act as the human (`you`).
 
+### Team leads (`BUS_ROLE`)
+
+For more than one team, give each team its own lead and add one small **head**:
+
+```sh
+BUS_ROLE=head BUS_AGENT=head claude                          # one per bus
+BUS_ROLE=lead BUS_AGENT=fe-lead BUS_TEAM=frontend claude     # one per team
+BUS_ROLE=lead BUS_AGENT=be-lead BUS_TEAM=backend claude
+BUS_AGENT=fe-1 BUS_TEAM=frontend claude                      # workers: no BUS_ROLE
+```
+
+- **Head:** owns hot files, interfaces and `bus request`s; can manage any team's tasks; reviews and merges tasks that a lead owns itself (e.g. the head's "Build the frontend" task taken by fe-lead). Inactive leads are reported to it.
+- **Team lead:** adds tasks only for its own team (they default to `--for <team>`), and is the one told when its team's tasks pass, are approved or rejected, or when a teammate goes inactive. It merges and runs `bus task merged`, `reassign`, `drop` and `bus report` only for its team, and never signs off its own task. Hot files are blocked for it like for a worker.
+- **Tasks carry a team** (`--team t`, or derived from `--for`), and only that team's members can take them. Leads and the head are never offered tasks automatically, only ones that name them.
+- Roles are fixed at join. There can be only one head, and one lead per team. The shell guard blocks changing `BUS_ROLE`. The pre-commit merge exemption covers any `BUS_ROLE=lead|head` session.
+- Without `BUS_ROLE`, an agent named `lead` is the head, so single-lead setups work unchanged.
+
 ## How messages reach agents
 
 - `bus send @bob ...` is a DM. `bus send @frontend ...` posts to `#frontend` and mentions the team. `bus send #general ...` is a plain channel post.
@@ -122,7 +139,7 @@ This is off by default, so existing setups keep working. Start the server with `
 - **With `BUS_AUTH=1`,** any request with no agent name (or the name `you`) needs the human token, or it gets 401. That covers everything only the human can do (approve, reject, `auth reset`, releasing another agent's claims) and the dashboard's own reads. Without `BUS_AUTH` nothing changes.
 - **Shell guard:** `bus init` adds a PreToolUse hook on `Bash|PowerShell`. For agent sessions (`BUS_AGENT` set), it blocks commands that run `bus approve|reject|auth`, call those API endpoints, unset or override `BUS_AGENT` (`unset`, `BUS_AGENT=…`, `export`, `env -u`/`-i`, `$env:BUS_AGENT`, `set`), or touch `~/.agentic-chat`. Each block is one line: `bus: blocked — this command … Agents can't act as the human; ask @you.` It errs toward blocking, so a commit message that contains `bus approve` is refused too.
 - **Deny rules:** `bus init` also adds `Read(~/.agentic-chat/**)` and `Edit(~/.agentic-chat/**)` to `permissions.deny` in `.claude/settings.json`.
-- **Merge commits:** the pre-commit guard exempts only the lead concluding a merge.
+- **Merge commits:** the pre-commit guard exempts only a lead or the head (`BUS_ROLE`) concluding a merge.
 
 **What this does and doesn't protect against:** these are guard rails against mistakes and casual misuse. They stop an agent that follows instructions badly, guesses at a shortcut, or tries the obvious workaround. They are **not** a security boundary against a malicious process running as your user:
 - Such a process can read `~/.agentic-chat` with tools the hooks don't see.
