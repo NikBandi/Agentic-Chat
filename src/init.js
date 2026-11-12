@@ -17,7 +17,7 @@ export const AGENT_RULES = `${START}
 - Hot files (package.json, lockfiles, shared types, global config) belong to the head: \`bus request <file> "change"\` instead of editing.
 - When a hook notice says something is waiting, run \`bus read\`. Never poll. Blocked on someone? \`bus wait\`.
 - Commit your work on your branch before bus task done.
-- Leads: plan and review only your own team's tasks; contract and hot-file questions go to @head. Merge with plain \`git merge <sha>\` — no squash or rebase.
+- Leads: plan and review only your own team's tasks; start workers with \`bus spawn <ids>\` (max 4 run at once — spawn only tasks that can run in parallel); contract and hot-file questions go to @head. Merge with plain \`git merge <sha>\` — no squash or rebase.
 - Done: \`bus task done <id> "summary"\` runs the done-check; fix failures and retry. On bus task done, include --report with up to 3 lines.
 - Keep messages short; @mention only who must act. Full text of a truncated message: \`bus show <id>\`.
 ${END}`;

@@ -39,7 +39,7 @@ export class Tasks {
     return !t.assignee || t.assignee === a.name || t.assignee === a.team;
   }
   /** Leads and the head never get tasks offered automatically (they take one only when it names them). */
-  #autoOffer(a) { return this.bus.roleOf(a.name) === 'worker'; }
+  #autoOffer(a) { return this.bus.roleOf(a.name) === 'worker' && !a.spawned; } // spawned workers do only the task they were started for
   /** Who reviews and merges #t: its team's lead, or the head (also when the lead owns the task itself). */
   reviewer(t) {
     const r = this.bus.leadFor(t.team);
@@ -238,6 +238,7 @@ export class Tasks {
     t.status = 'in_progress';
     Object.assign(this.#mr(t), { status: 'rejected', reason: why });
     this.bus.log(`#${t.id} rejected: ${why}`);
+    this.bus.emit('task', { type: 'rejected', task: t, why });
     this.bus.notify(t.owner, `#${t.id} rejected: ${why} — fix it, then: bus task done ${t.id}`);
     const rev = this.reviewer(t);
     if (!seen.includes(rev)) this.bus.notify(rev, `#${t.id} rejected: ${why}`);
@@ -276,6 +277,7 @@ export class Tasks {
     Object.assign(this.#mr(t), { status: 'merged' });
     this.#free(t);
     this.bus.log(`#${t.id} merged`);
+    this.bus.emit('task', { type: 'merged', task: t });
     for (const d of this.s.tasks.filter((x) => x.after.includes(t.id))) this.offer(d, `#${t.id} merged — rebase and start: `);
     if (t.owner) this.offerNext(t.owner);
     this.#touch(t);
@@ -294,6 +296,7 @@ export class Tasks {
     this.s.mergeRequests = this.s.mergeRequests.filter((m) => m.task !== t.id);
     Object.assign(t, { owner: null, status: 'open', assignee: to, offered: [], branch: null, commit: null });
     this.bus.log(`#${t.id} reassigned ${old ?? '-'} -> ${to}`);
+    this.bus.emit('task', { type: 'reassigned', task: t });
     if (old && old !== to) { this.bus.notify(old, `#${t.id} was reassigned to ${to} — stop work on it`); this.offerNext(old); }
     this.offer(t);
     this.#touch(t);
@@ -310,6 +313,7 @@ export class Tasks {
     t.status = 'dropped';
     t.owner = null;
     this.bus.log(`#${t.id} dropped`);
+    this.bus.emit('task', { type: 'dropped', task: t });
     if (old) { this.bus.notify(old, `#${t.id} was dropped — stop work on it`); this.offerNext(old); }
     const blocked = this.s.tasks.filter((x) => x.after.includes(t.id) && !['merged', 'dropped'].includes(x.status));
     const rev = this.reviewer(t);

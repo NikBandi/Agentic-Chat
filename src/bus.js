@@ -391,7 +391,7 @@ export class Bus extends EventEmitter {
   sweep(ms, busy = new Set(), now = Date.now()) {
     const flagged = [];
     for (const a of Object.values(this.s.agents)) {
-      if (a.inactive || this.roleOf(a.name) === HEAD || busy.has(a.name) || now - a.lastSeen < ms) continue;
+      if (a.inactive || this.roleOf(a.name) === HEAD || busy.has(a.name) || (a.spawned && this.s.spawns?.[a.name]?.status !== 'running') || now - a.lastSeen < ms) continue;
       a.inactive = true;
       flagged.push(a.name);
       const mins = Math.round((now - a.lastSeen) / 60000);

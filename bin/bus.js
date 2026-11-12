@@ -35,6 +35,8 @@ const HELP = `bus — local agent chat, claims and tasks
   bus report <id>                       the task's report (its lead/head/human)
   bus task merged <id> [--force]        (its lead/head) after merging; verifies the commit is in main
   bus task reassign <id> <agent> | drop <id>                    (its lead/head/human)
+  bus spawn <ids...>                    start a headless worker per task (own worktree; max BUS_MAX_WORKERS=4 at once, rest queue)  (lead/head)
+  bus workers [stop <name>]             spawned workers: running/queued/exited
   bus approve <id> | bus reject <id> "why"                      (human)
   bus auth reset <agent>                drop an agent's token (BUS_AUTH=1)  (human)
   bus dashboard [--no-open]             print + open the dashboard link with your token  (human)`;
@@ -222,6 +224,24 @@ const commands = {
     const fn = { pre: hooks.preEdit, post: hooks.postTool, bash: hooks.preBash, commit: () => hooks.preCommit() }[sub];
     if (!fn) throw new Error(`unknown hook "${sub}"`);
     process.exit(await fn());
+  },
+
+  async spawn(ids) {
+    if (!ids.length) throw new Error('usage: bus spawn <task-id...>');
+    for (const id of ids) {
+      const { worker: w, running, max } = await request('POST', '/api/spawn', { body: { id } });
+      console.log(`${w.name} ${w.status === 'running' ? 'started' : w.status} for #${w.task} (${running}/${max} running)`);
+    }
+  },
+
+  async workers([sub, name]) {
+    if (sub === 'stop') {
+      const { worker: w } = await request('POST', '/api/spawn/stop', { body: { name } });
+      return console.log(`${w.name}: ${w.note || w.status}`);
+    }
+    const { workers, running, max } = await request('GET', '/api/workers');
+    console.log(`${running}/${max} running`);
+    for (const w of workers) console.log(`${w.name} ${w.status} #${w.task}${w.note ? ' — ' + w.note : ''}`);
   },
 
   async report([id]) {
