@@ -79,7 +79,7 @@ These are requirements, not nice-to-haves.
 
 ## 5. Files, claims, and worktrees
 
-- **Worktrees:** every worker has its own git worktree/branch, so agents physically can't overwrite each other's files.
+- **Worktrees:** every worker has its own git worktree/branch, so agents physically can't overwrite each other's files. Git history is shared; the cost is each checkout's files. For spawned workers the bus keeps that small: new worktrees link `node_modules` to the main checkout (`BUS_SHARE_DEPS=0` to opt out), and a worker's worktree is removed once its task is merged (branch deleted with `git branch -d`) or dropped (branch kept). Dirty worktrees are never removed. `BUS_KEEP_WORKTREES=1` keeps them all.
 - **Claims** prevent two branches from changing the same file, so merges stay clean.
 - Claim paths are **repo-relative with forward slashes** (`src/api/users.ts`), so they mean the same thing in every worktree. Case-insensitive on Windows.
 - A claim can be a file, a directory (`src/api/` covers everything inside), or a glob (`src/**/*.css`).
