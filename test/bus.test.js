@@ -1,6 +1,6 @@
 import { test, describe, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { Bus, BusError, INBOX_CAP } from '../src/bus.js';
+import { Bus, BusError, INBOX_CAP, MESSAGE_KEEP } from '../src/bus.js';
 import { Store } from '../src/store.js';
 
 let bus;
@@ -155,6 +155,20 @@ describe('read / cursor', () => {
     assert.equal(bus.pending('bob'), 0);
     bus.send('alice', '@fe', 'after');
     assert.deepEqual(texts(bus.read('bob')), ['after']);
+  });
+  test(`state keeps the newest ${MESSAGE_KEEP} messages; older ones go to the store archive`, () => {
+    const archived = [];
+    bus.store.archive = (items) => archived.push(...items);
+    join('alice', 'fe'); join('bob', 'fe');
+    for (let i = 1; i <= MESSAGE_KEEP + 201; i++) bus.send('alice', '@bob', `m${i}`);
+    assert.equal(bus.s.messages.length, MESSAGE_KEEP);
+    assert.equal(archived.length, 201);
+    assert.equal(archived[0].text, 'm1');
+    assert.equal(bus.s.messages[0].text, 'm202');
+    assert.throws(() => bus.show(1), /archived/);
+    const r = bus.read('bob'); // inbox still capped and newest-first as before
+    assert.equal(r.messages.at(-1).text, `m${MESSAGE_KEEP + 201}`);
+    assert.equal(r.messages.length, INBOX_CAP);
   });
   test('read for unknown agent throws 404', () => {
     assert.throws(() => bus.read('ghost'), (e) => e.status === 404);

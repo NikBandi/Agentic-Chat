@@ -5,30 +5,88 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn as cpSpawn, execFile } from 'node:child_process';
 import { BusError, cleanName } from './bus.js';
-import { git, mainBranch } from './check.js';
+import { git, mainBranch, uncommitted } from './check.js';
 import { mergeSettings } from './init.js';
 
 export const DEFAULT_MAX = 4;
 export const maxWorkers = (env = process.env) => Math.min(Math.max(1, Number(env.BUS_MAX_WORKERS) || DEFAULT_MAX), 16);
 
-/** The worker's whole instruction set: short, because every worker pays for it. */
+/**
+ * The worker's whole instruction set: short, because every worker pays for it. Spawned workers get no SessionStart
+ * rules (BUS_SPAWNED), so the few rules that matter to them are here.
+ */
 export function workerPrompt({ name, team, task, reason = '' }) {
   return [
     `You are ${name}, a worker on team ${team}, in your own git worktree. Your only job is task #${task}.`,
     reason && `It was sent back: ${reason}. Fix that.`,
-    `1. bus join   2. bus task take ${task} (prints the brief: it is your full context; also read docs it names)`,
+    `1. bus join   2. bus task take ${task} (prints the brief, files to read first and notes: your full context)`,
     `3. Do the work (tests first), commit on your branch.`,
     `4. bus task done ${task} --report "<what you built; problems; anything unfinished — max 3 lines>". If the check fails, fix and rerun.`,
     `When bus task done says the check passed, stop: you are finished. Blocked on someone? bus send @<agent> "..." then bus wait.`,
+    `Edit only files your task claims; if an edit is blocked, ask the owner — never work around it. Hot files: bus request <file> "change".`,
+    `Hook notices show short messages inline, else run bus read. Learned a module others need? bus note add <path> "<≤5 lines>".`,
   ].filter(Boolean).join('\n');
 }
 
-/** argv for the worker process (model, budget and permission mode from env). */
-export function workerArgs(prompt, settingsFile, env = process.env) {
-  const args = ['-p', prompt, '--settings', settingsFile, '--permission-mode', env.BUS_WORKER_PERMISSION || 'bypassPermissions'];
-  if (env.BUS_WORKER_MODEL) args.push('--model', env.BUS_WORKER_MODEL);
+/** Prompt for a rejected worker resumed in its own session: it already knows the task and the code. */
+export const resumePrompt = ({ task, reason }) =>
+  `#${task} was sent back: ${reason}. Fix that, commit, then bus task done ${task} --report "<max 3 lines>". When the check passes, stop.`;
+
+/** Shell commands every worker may run without a prompt: the bus itself and git. The task's check is added per task. */
+export const WORKER_ALLOW = ['Bash(bus:*)', 'Bash(git:*)'];
+
+const csv = (v) => (v ? String(v).split(',').map((s) => s.trim()).filter(Boolean) : []);
+
+export const DEFAULT_WORKER_MODEL = 'sonnet';
+export const DEFAULT_SETTING_SOURCES = 'project,local';
+
+/**
+ * argv for the worker process.
+ * - Lean: no MCP servers (--strict-mcp-config) and no user-level settings (--setting-sources project,local), so a
+ *   worker doesn't load the human's plugins, hooks and MCP tools. BUS_WORKER_SETTING_SOURCES=all loads everything.
+ * - Model: BUS_WORKER_MODEL, default sonnet; "default" passes no --model (the CLI's own default).
+ * - JSON output: the final result carries session_id (for --resume on reject) and cost.
+ * - Permissions: acceptEdits by default: file edits in the worktree are allowed, and shell commands only from an
+ *   allowlist (bus, git, the task's done-check, plus BUS_WORKER_ALLOW). Headless sessions can't answer prompts, so
+ *   anything else is denied. BUS_WORKER_PERMISSION=bypassPermissions restores the old behaviour.
+ */
+export function workerArgs(prompt, settingsFile, env = process.env, { check = '', resume = '' } = {}) {
+  const mode = env.BUS_WORKER_PERMISSION || 'acceptEdits';
+  const sources = env.BUS_WORKER_SETTING_SOURCES || DEFAULT_SETTING_SOURCES;
+  const model = env.BUS_WORKER_MODEL || DEFAULT_WORKER_MODEL;
+  const args = ['-p', prompt, '--output-format', 'json', '--settings', settingsFile, '--strict-mcp-config'];
+  if (sources !== 'all') args.push('--setting-sources', sources);
+  args.push('--permission-mode', mode);
+  if (model !== 'default') args.push('--model', model);
   if (env.BUS_WORKER_BUDGET) args.push('--max-budget-usd', String(env.BUS_WORKER_BUDGET));
+  if (resume) args.push('--resume', resume);
+  if (mode !== 'bypassPermissions') {
+    args.push('--allowedTools', ...WORKER_ALLOW, ...(check ? [`Bash(${check})`] : []), ...csv(env.BUS_WORKER_ALLOW));
+  }
   return args;
+}
+
+export const TAIL_CHARS = 300;
+
+/**
+ * What a worker run left in its log (from byte `start`): the --output-format json result object, if any, and a short
+ * one-line tail for the lead: the result text, else the last few log lines.
+ */
+export function readRun(log, start = 0) {
+  let text = '';
+  try {
+    const buf = fs.readFileSync(log);
+    text = buf.subarray(Math.min(start, buf.length)).toString('utf8');
+  } catch { return { result: null, tail: '' }; }
+  let result = null;
+  const lines = text.split(/\r?\n/).filter((l) => l.trim());
+  for (let i = lines.length - 1; i >= 0 && !result; i--) {
+    if (!lines[i].trimStart().startsWith('{')) continue;
+    try { const o = JSON.parse(lines[i]); if (o?.type === 'result') result = o; } catch { /* not JSON */ }
+  }
+  const raw = typeof result?.result === 'string' && result.result.trim() ? result.result : lines.filter((l) => !l.trimStart().startsWith('{')).slice(-5).join(' ⏎ ');
+  const flat = raw.replace(/\s*\n\s*/g, ' ⏎ ').trim();
+  return { result, tail: flat.length > TAIL_CHARS ? '…' + flat.slice(-TAIL_CHARS) : flat };
 }
 
 /** Default launcher: start the process with output to a log file; returns {pid, kill, onExit}. */
@@ -167,13 +225,17 @@ export class Spawner {
     const logDir = path.join(this.dataDir, 'workers');
     fs.mkdirSync(logDir, { recursive: true });
     const log = path.join(logDir, `${w.name}.log`);
-    const env = { ...this.env, BUS_AGENT: w.name, BUS_TEAM: w.team, ECC_HOOK_PROFILE: this.env.ECC_HOOK_PROFILE || 'minimal' };
+    const env = { ...this.env, BUS_AGENT: w.name, BUS_TEAM: w.team, BUS_SPAWNED: '1' }; // BUS_SPAWNED: no SessionStart rules
     delete env.BUS_ROLE;
     if (this.port && !env.BUS_URL) env.BUS_PORT = String(this.port);
-    const prompt = workerPrompt({ name: w.name, team: w.team, task: t.id, reason: w.reason });
-    const h = this.launcher({ cmd: this.env.BUS_CLAUDE || 'claude', args: workerArgs(prompt, this.#settingsFile(), this.env), cwd: wt, env, log });
+    // Rejected and its session is known: resume it (it keeps what it learned) instead of starting cold.
+    const resume = w.reason && w.session ? w.session : '';
+    const prompt = resume ? resumePrompt({ task: t.id, reason: w.reason }) : workerPrompt({ name: w.name, team: w.team, task: t.id, reason: w.reason });
+    let logStart = 0;
+    try { logStart = fs.statSync(log).size; } catch { /* new log */ }
+    const h = this.launcher({ cmd: this.env.BUS_CLAUDE || 'claude', args: workerArgs(prompt, this.#settingsFile(), this.env, { check: t.check, resume }), cwd: wt, env, log });
     this.procs.set(w.name, h);
-    Object.assign(w, { status: 'running', pid: h.pid, worktree: wt, log, startedAt: Date.now(), runs: (w.runs ?? 0) + 1 });
+    Object.assign(w, { status: 'running', pid: h.pid, worktree: wt, log, logStart, resumed: !!resume, startedAt: Date.now(), runs: (w.runs ?? 0) + 1 });
     this.bus.log(`${w.name} started for #${t.id} (${this.running().length}/${this.max} running)`);
     h.onExit((code, err) => this.#exited(w.name, code, err));
   }
@@ -183,19 +245,46 @@ export class Spawner {
     this.procs.delete(name);
     if (!w || w.status !== 'running') return;
     Object.assign(w, { status: 'exited', code, endedAt: Date.now(), ...(err && { note: err }) });
+    const run = readRun(w.log, w.logStart);
+    if (run.result) {
+      if (run.result.session_id) w.session = run.result.session_id;
+      if (typeof run.result.total_cost_usd === 'number') w.cost = Math.round(((w.cost ?? 0) + run.result.total_cost_usd) * 1e4) / 1e4;
+    } else if (w.resumed) delete w.session; // the resume failed (session gone?): next spawn starts fresh
     const t = this.s.tasks.find((x) => x.id === w.task);
     this.bus.log(`${name} exited (code ${code}) — #${w.task} ${t?.status ?? '?'}`);
-    // Only worth a lead's tokens when the worker stopped without handing its task in.
+    // Only worth a lead's tokens when the worker stopped without handing its task in. The tail of what it said
+    // comes along, so the lead doesn't have to open the whole log to see why.
     const unfinished = t && (t.status === 'open' || (t.status === 'in_progress' && t.owner === name));
     if (unfinished && !/^stopped by/.test(w.note ?? '')) {
-      this.bus.notify(this.tasks.reviewer(t), `${name} exited with #${t.id} unfinished (log: ${w.log}) — bus spawn ${t.id} to retry, or bus task reassign ${t.id} <agent>`);
+      this.bus.notify(this.tasks.reviewer(t), `${name} exited with #${t.id} unfinished${run.tail ? ` — last words: ${run.tail}` : ''} (log: ${w.log}) — bus spawn ${t.id} to retry, or bus task reassign ${t.id} <agent>`);
     }
     this.bus.store.save();
+    if (t?.status === 'merged') this.cleanup(name).catch(() => {}); // merged while it was still running
     this.pump();
+  }
+
+  /**
+   * After a spawned worker's task merges, remove its worktree and branch (the bus made them, so the bus cleans up).
+   * Only a worktree with nothing uncommitted (the bus's own .bus/ aside) is removed; the branch is deleted with
+   * `git branch -d`, which refuses unless it is merged. Anything that can't be removed is left and logged.
+   */
+  async cleanup(name) {
+    const w = this.s.spawns[name];
+    if (!w || w.status !== 'exited' || w.cleaned || !w.worktree || !fs.existsSync(w.worktree)) return false;
+    const dirty = await uncommitted(w.worktree);
+    if (dirty) { this.bus.log(`${name}: worktree kept (${dirty} uncommitted file${dirty === 1 ? '' : 's'}) — ${w.worktree}`); return false; }
+    const rm = await git(['worktree', 'remove', '--force', w.worktree], this.repo); // --force: only .bus/ can be left (checked above)
+    if (rm.code !== 0) { this.bus.log(`${name}: couldn't remove worktree: ${rm.err.split('\n')[0]}`); return false; }
+    const br = await git(['branch', '-d', name], this.repo);
+    w.cleaned = true;
+    this.bus.log(`${name}: worktree removed${br.code === 0 ? ', branch deleted' : ` (branch kept: ${br.err.split('\n')[0]})`}`);
+    this.bus.store.save();
+    return true;
   }
 
   #onTask({ type, task: t, why }) {
     const w = t.owner && this.s.spawns[t.owner];
+    if (type === 'merged' && w) this.cleanup(t.owner).catch((e) => this.bus.log(`${t.owner}: cleanup failed: ${e.message}`));
     if (type === 'rejected' && w && w.status === 'exited') {
       this.#record(t.owner, t, w.by, why);
       this.bus.log(`${t.owner} re-queued for rejected #${t.id}`);

@@ -17,6 +17,12 @@ A local coordination layer that lets many Claude Code agents work on one codebas
 
 The human starts the head and lead sessions (and may start workers) in Orca's terminal with a name and team. Leads may also **spawn workers** themselves (`bus spawn <task>`): one headless Claude session in its own worktree per task, at most `BUS_MAX_WORKERS` (default 4) at once, each exiting once its check passes. See README "Lead-spawned workers".
 
+Spawned workers are **lean and scoped**:
+- They load no MCP servers and no user-level settings, and default to the `sonnet` model.
+- They run in `acceptEdits` mode. Shell commands are limited to `bus`, `git`, the task's done-check and `BUS_WORKER_ALLOW`; `BUS_WORKER_PERMISSION=bypassPermissions` opts out.
+- A rejected worker **resumes its own session** (`--resume`, from the `--output-format json` session id) instead of starting cold.
+- After merge, the bus removes the worktree and branch it created, unless there is uncommitted work.
+
 ---
 
 ## 2. Workflow
@@ -25,6 +31,7 @@ The human starts the head and lead sessions (and may start workers) in Orca's te
 2. **Lead plans:** the lead creates tasks on the board. Each task has:
    - title and a self-contained brief (goal, constraints, interfaces it must match) — written so the worker never needs chat history
    - **files** it owns (files, directories ending in `/`, or globs)
+   - **context** (optional): files the worker should read first, so it doesn't explore. Shown on take, together with any **notes** on the task's files (see §4).
    - **done-check**: a shell command that must pass (e.g. `npm test -- users`)
    - **dependencies** on other tasks (optional)
    - **assignee**: a specific agent or a team
@@ -66,14 +73,18 @@ Claims, releases, task status changes, and inactivity notices go to an **activit
 These are requirements, not nice-to-haves.
 
 1. **No polling.** Agents never loop on "check messages".
-   - A Claude Code hook (PostToolUse) adds a **one-line notice** to the agent's context **only when something is waiting** (e.g. `bus: 1 new mention from @backend-2 — run bus read`). When nothing is waiting it outputs nothing → zero tokens. *(Verify the exact hook output format against current Claude Code docs before implementing.)*
-   - When blocked, an agent runs `bus wait`, which blocks at zero token cost until a message for it arrives.
-2. **Self-contained task briefs** so workers don't read history.
+   - A Claude Code hook (PostToolUse) adds a notice to the agent's context **only when something is waiting**. When nothing is waiting it outputs nothing → zero tokens.
+   - **Short messages are delivered in the notice itself:** up to 2 one-line messages of ≤200 chars, which then count as read. That saves a `bus read` call. Bigger batches get one line: `bus: 3 new for you (from @alice) — run: bus read`.
+   - When blocked, an agent runs `bus wait`, which blocks at zero token cost until a message for it arrives. Agents are told to run `bus wait 3600` in the background (`run_in_background`) and end their turn, so long waits cost no repeated tool calls.
+2. **Self-contained task briefs** so workers don't read history, plus **`--context`** (files to read first) and **notes**. A note is ≤5 lines on a file or dir, left by an agent that learned it. Notes overlapping the task's files are printed by `bus task take` in the same call, so the next agent reads a summary instead of the source.
 3. **Automatic handoffs** for dependencies — nobody asks "is it ready yet?".
 4. **Compact CLI output:** one line per message, no decoration. Long messages truncated with `bus show <id>` for the full text. Catch-up after a long gap is capped (e.g. last 30, with a "N older skipped" note).
 5. **Routine events stay out of agent inboxes** (activity log only).
-6. **Tiny agent instructions:** the rules injected into each agent's CLAUDE.md stay around 10 lines.
-7. **Done-check output is truncated** to the last relevant lines on failure.
+6. **Tiny agent instructions, only for agents:**
+   - The rules (about 8 lines) are injected by a **SessionStart hook** only when `BUS_AGENT` is set, never written to CLAUDE.md. Workers get the worker lines and leads one more; they are re-injected after a compaction.
+   - Spawned workers skip them, because their prompt already carries what they need.
+7. **Done-check output is truncated** to the last relevant lines on failure. A worker that exits unfinished sends its lead its last words (≤300 chars), not just a log path.
+8. **Measure it.** A Stop hook reads each session's transcript and reports cumulative token counts to the bus, silently. The bus adds the increase to the agent and its task, shown by `bus usage`, `bus report` and the dashboard. Spawned workers also record USD cost from their JSON result.
 
 ---
 
@@ -156,7 +167,7 @@ bus release <paths...> | --all
 bus claims [--mine]
 bus request <hot-file> "change"         ask the lead to change a hot file
 
-bus task add "title" --files a,b/ --check "cmd" [--after 3,4] [--for agent|team]   (lead)
+bus task add "title" --files a,b/ --check "cmd" [--context x,y] [--after 3,4] [--for agent|team]   (lead)
 bus task list [--mine]
 bus task take <id>
 bus task done <id> ["summary"] [--report "≤3 lines"] [--allow-dirty]   needs committed work; runs the done-check → merge request + report
@@ -165,6 +176,8 @@ bus task merged <id> [--force]          (lead) verifies the commit is in main, t
 bus task reassign <id> <agent>          (lead/human)
 bus approve <id> | bus reject <id> "why" (human, also via dashboard)
 bus auth reset <agent>                  (human) drop an agent's token when BUS_AUTH=1
+bus note add <path> "≤5 lines" | <path> | list | rm <path>   shared notes on a file or dir/
+bus usage                               tokens per agent and per task
 ```
 
 ---
@@ -175,7 +188,8 @@ bus auth reset <agent>                  (human) drop an agent's token when BUS_A
 - Binds to `127.0.0.1` only.
 - Persistence shape (epoch-ms timestamps):
   `{ messages[], agents{}, teams{}, claims[], tasks[], mergeRequests[], hotFiles[], interfaces[] }`
-- `bus init` merges into an existing `.claude/settings.json` without clobbering other settings and appends the agent instructions to the project's CLAUDE.md between `<!-- agent-bus -->` markers.
+- `bus init` merges its hooks into an existing `.claude/settings.json` without clobbering other settings. The hooks are PreToolUse edit and shell guards, the PostToolUse notice, SessionStart rules and Stop usage. It does **not** write agent rules to CLAUDE.md, because every session in the project would pay for them. It removes a `<!-- agent-bus -->` block left there by an older version.
+- State keeps the newest 1,000 messages; older ones are appended to `archive.jsonl` next to the state file. Because inboxes are capped at 30, no agent loses a message it would have been shown. The CLI and hooks import only small modules (the port lives in `constants.js`); only `bus serve` loads the server.
 
 ### Orca overlap — check first
 The project will be developed and run inside the Orca IDE, which already manages worktrees and has its own agent messaging/task handoff. Before building, check what Orca provides and **reuse it rather than rebuild it** (especially worktree creation). The parts that are unique to this project: file claims with edit blocking, mention-only inboxes, done-checks, merge approval, hot-file ownership, and interface alerts.

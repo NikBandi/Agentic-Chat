@@ -1,4 +1,6 @@
-// `bus init [project]`: merge bus hooks into .claude/settings.json and add agent rules to CLAUDE.md.
+// `bus init [project]`: merge bus hooks into .claude/settings.json and install the git pre-commit guard.
+// Agent rules are no longer written to CLAUDE.md (every session in the project paid for them): the SessionStart hook
+// injects them only into agent sessions. An agent-rules block left by an older `bus init` is removed.
 // Idempotent; never clobbers other settings or CLAUDE.md content outside the markers.
 import fs from 'node:fs';
 import path from 'node:path';
@@ -9,25 +11,17 @@ const BUS_BIN = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..',
 const START = '<!-- agent-bus -->';
 const END = '<!-- /agent-bus -->';
 
-export const AGENT_RULES = `${START}
-## Agent bus (applies only when BUS_AGENT is set)
-- You are $BUS_AGENT on team $BUS_TEAM (role $BUS_ROLE; unset = worker). Coordinate only via the \`bus\` CLI (\`bus help\`).
-- Start: \`bus join\`, \`bus task list --mine\`, \`bus task take <id>\`. The task brief is your full context.
-- Edit only files your task claims. If an edit is blocked, ask the owner (\`bus send @owner "..."\`); never work around it with shell writes.
-- Hot files (package.json, lockfiles, shared types, global config) belong to the head: \`bus request <file> "change"\` instead of editing.
-- When a hook notice says something is waiting, run \`bus read\`. Never poll. Blocked on someone? \`bus wait\`.
-- Commit your work on your branch before bus task done.
-- Leads: plan and review only your own team's tasks; start workers with \`bus spawn <ids>\` (max 4 run at once — spawn only tasks that can run in parallel); contract and hot-file questions go to @head. Merge with plain \`git merge <sha>\` — no squash or rebase.
-- Done: \`bus task done <id> "summary"\` runs the done-check; fix failures and retry. On bus task done, include --report with up to 3 lines.
-- Keep messages short; @mention only who must act. Full text of a truncated message: \`bus show <id>\`.
-${END}`;
+export { rulesFor } from './rules.js';
 
 const hookCmd = (sub) => `node "${BUS_BIN.replace(/\\/g, '/')}" hook ${sub}`;
 
+/** No matcher = every source/event (SessionStart also fires after a compaction, re-injecting the rules). */
 export const HOOKS = [
   { event: 'PreToolUse', matcher: 'Edit|Write|MultiEdit|NotebookEdit', sub: 'pre' },
   { event: 'PreToolUse', matcher: 'Bash|PowerShell', sub: 'bash' },
   { event: 'PostToolUse', matcher: '*', sub: 'post' },
+  { event: 'SessionStart', sub: 'start' },
+  { event: 'Stop', sub: 'stop' },
 ];
 
 /** Agents may not read (or write) the human's token directory. */
@@ -47,9 +41,13 @@ export function mergeSettings(settings) {
     const existing = list.find((g) => g.hooks?.some(isOurs));
     if (existing) {
       const h = existing.hooks.find(isOurs);
-      if (h.command !== cmd || existing.matcher !== matcher) { h.command = cmd; existing.matcher = matcher; changed = true; }
+      if (h.command !== cmd || existing.matcher !== matcher) {
+        h.command = cmd;
+        if (matcher === undefined) delete existing.matcher; else existing.matcher = matcher;
+        changed = true;
+      }
     } else {
-      list.push({ matcher, hooks: [{ type: 'command', command: cmd, timeout: 5 }] });
+      list.push({ ...(matcher !== undefined && { matcher }), hooks: [{ type: 'command', command: cmd, timeout: 5 }] });
       changed = true;
     }
   }
@@ -99,11 +97,12 @@ export function installGitHook(dir) {
   return `installed pre-commit hook in ${hooks}`;
 }
 
-/** Insert or replace the marked agent-rules block. */
-export function mergeClaudeMd(text) {
+/** Remove the marked agent-rules block an older `bus init` wrote; anything else is left as it was. */
+export function stripClaudeMd(text) {
   const s = text.indexOf(START), e = text.indexOf(END);
-  if (s !== -1 && e > s) return text.slice(0, s) + AGENT_RULES + text.slice(e + END.length);
-  return (text.trimEnd() ? text.trimEnd() + '\n\n' : '') + AGENT_RULES + '\n';
+  if (s === -1 || e < s) return text;
+  const rest = (text.slice(0, s) + text.slice(e + END.length)).replace(/\n{3,}/g, '\n\n').trim();
+  return rest ? rest + '\n' : '';
 }
 
 export function init(projectDir = process.cwd()) {
@@ -123,10 +122,11 @@ export function init(projectDir = process.cwd()) {
   } else out.push(`hooks already present in ${settingsFile}`);
 
   const mdFile = path.join(dir, 'CLAUDE.md');
-  const before = fs.existsSync(mdFile) ? fs.readFileSync(mdFile, 'utf8') : '';
-  const after = mergeClaudeMd(before);
-  if (after !== before) { fs.writeFileSync(mdFile, after); out.push(`updated ${mdFile}`); }
-  else out.push(`agent rules already current in ${mdFile}`);
+  if (fs.existsSync(mdFile)) {
+    const before = fs.readFileSync(mdFile, 'utf8');
+    const after = stripClaudeMd(before);
+    if (after !== before) { fs.writeFileSync(mdFile, after); out.push(`removed the old agent rules from ${mdFile} (the SessionStart hook injects them now)`); }
+  }
   out.push(installGitHook(dir));
   return out;
 }

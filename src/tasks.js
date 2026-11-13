@@ -1,6 +1,6 @@
 // Tasks: dependencies, take (claims files), done-checks, merge requests, approval, merge, auto-handoff.
 // Lifecycle: open -> in_progress -> review -> approved -> merged      (+ dropped; reject: review -> in_progress)
-import { BusError, HUMAN, cleanName } from './bus.js';
+import { BusError, HUMAN, cleanName, fmtUsage } from './bus.js';
 import { normPath } from './paths.js';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -50,7 +50,7 @@ export class Tasks {
     if (!ok) throw new BusError(`only ${this.reviewer(t)}, the head or the human can ${what} #${t.id}`, 403);
   }
 
-  add(who, { title, brief = '', files = [], check, after = [], assignee, team, timeout } = {}) {
+  add(who, { title, brief = '', files = [], context = [], check, after = [], assignee, team, timeout } = {}) {
     if (!this.bus.isBoss(who)) throw new BusError('only a lead, the head or the human can add tasks', 403);
     title = String(title ?? '').trim();
     if (!title) throw new BusError('task needs a title');
@@ -74,6 +74,7 @@ export class Tasks {
     const now = Date.now();
     const t = {
       id: ++this.s.taskSeq, title, brief: String(brief), files: [...new Set(files.map(normPath).filter(Boolean))],
+      context: [...new Set((context ?? []).map(normPath).filter(Boolean))], // files to read first, chosen by the lead
       check, after: deps, assignee, team, by: cleanName(who), status: 'open', owner: null, offered: [],
       timeout: Math.min(Math.max(1, Number(timeout) || 600), 3600), result: null, summary: '', branch: null, commit: null,
       createdAt: now, updatedAt: now,
@@ -213,7 +214,7 @@ export class Tasks {
     const t = this.get(id);
     if (!this.bus.isBossOf(who, t.team)) throw new BusError(`only ${this.reviewer(t)}, the head or the human can read #${t.id}'s report`, 403);
     if (!t.report) throw new BusError(`#${t.id} has no report yet — one is written when its done-check passes`, 404);
-    return t.report.text;
+    return t.report.text + (t.usage ? `\n${fmtUsage(t.usage)}` : ''); // usage keeps growing after the report is built
   }
 
   approve(who, id) {
@@ -329,7 +330,7 @@ export class Tasks {
     const a = t.owner && this.s.agents[t.owner];
     if (!a) return;
     this.bus.release(a.name, null, true);
-    if (a.task === t.id) a.task = null;
+    if (a.task === t.id) { a.task = null; a.lastTask = t.id; } // usage reported after this still counts toward t
   }
 
   /** "approve #4" / "@fe-lead reject #4 reason" from the human in chat (any one @mention prefix). */

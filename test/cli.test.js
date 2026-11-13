@@ -35,6 +35,30 @@ function bus(args, { agent, team, url = () => `http://127.0.0.1:${port}` } = {})
 }
 
 describe('cli', () => {
+  test('notes + --context: take prints "read first" and the notes on its files, with no extra calls', async () => {
+    const zed = { agent: 'zed', team: 'notes' };
+    await bus(['join'], zed);
+    const add = await bus(['note', 'add', 'notesdemo/', 'REST handlers;', 'auth in mw.js']);
+    assert.notEqual(add.code, 0); // the human has no identity to sign a note with
+    assert.match((await bus(['note', 'add', 'notesdemo/', 'REST handlers; auth lives in mw.js'], { agent: 'amy', team: 'notes' })).out, /^noted notesdemo\/$/);
+    assert.match((await bus(['note', 'add', 'x', 'a\nb\nc\nd\ne\nf'], zed)).err, /at most 5 lines/);
+    const t = await bus(['task', 'add', 'Users API', '--files', 'notesdemo/users.js', '--context', 'docs/api.md', '--check', 'node -v', '--for', 'zed']);
+    assert.equal(t.code, 0, t.err);
+    const id = t.out.match(/#(\d+)/)[1];
+    const take = await bus(['task', 'take', id], zed);
+    assert.equal(take.code, 0, take.err);
+    assert.match(take.out, /^read first: docs\/api\.md$/m);
+    assert.match(take.out, /^notesdemo\/ \(amy, \d+s ago\): REST handlers; auth lives in mw\.js$/m);
+    assert.match((await bus(['note', 'notesdemo/'], zed)).out, /^notesdemo\/ \(amy/);
+    assert.match((await bus(['note', 'list'], zed)).out, /^notesdemo\/ \(amy, \d+s ago\)$/);
+    assert.equal((await bus(['note', 'rm', 'notesdemo/'], zed)).code, 1); // not the author, not a lead
+    assert.match((await bus(['note', 'rm', 'notesdemo/'], { agent: 'amy', team: 'notes' })).out, /^removed note on notesdemo\/$/);
+  });
+
+  test('usage: says so when nothing is recorded yet', async () => {
+    assert.match((await bus(['usage'])).out, /^no usage recorded yet/);
+  });
+
   test('join, who', async () => {
     const j = await bus(['join'], { agent: 'bob', team: 'frontend' });
     assert.equal(j.code, 0, j.err);

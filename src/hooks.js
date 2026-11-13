@@ -7,6 +7,7 @@ import { request, baseUrl, NotRunning } from './client.js';
 import { toRepoPath } from './paths.js';
 import { git } from './check.js';
 import { cleanName, LEAD } from './bus.js';
+import { rulesFor } from './rules.js';
 
 /** A lead-like session (may conclude merges): BUS_ROLE lead|head, or the legacy agent named lead. */
 export const isLeadSession = (env = process.env) => ['lead', 'head'].includes(cleanName(env.BUS_ROLE)) || cleanName(env.BUS_AGENT) === LEAD;
@@ -71,6 +72,61 @@ export async function postTool() {
   }
   reachable();
   if (r.notice) say('PostToolUse', r.notice);
+  return 0;
+}
+
+/**
+ * SessionStart: put the role's agent rules in context. Nothing for the human (no BUS_AGENT) or for spawned workers,
+ * whose prompt already holds their instructions, so neither pays for rules it doesn't need.
+ */
+export async function sessionStart(env = process.env) {
+  if (!env.BUS_AGENT || env.BUS_SPAWNED) return 0;
+  process.stdin.resume();
+  process.stdin.on('data', () => {});
+  process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: rulesFor(env) } }));
+  return 0;
+}
+
+/** Sum token usage in a transcript (deduped by message id: each content block repeats its message's usage). */
+export function transcriptUsage(file, sessionId = '') {
+  const files = [file];
+  try { // subagent transcripts live in <dir>/<session>/subagents/*.jsonl
+    const sub = path.join(path.dirname(file), sessionId || path.basename(file, '.jsonl'), 'subagents');
+    for (const f of fs.readdirSync(sub)) if (f.endsWith('.jsonl')) files.push(path.join(sub, f));
+  } catch { /* none */ }
+  const byMsg = new Map();
+  let read = false;
+  for (const f of files) {
+    let text;
+    try { text = fs.readFileSync(f, 'utf8'); read = true; } catch { continue; }
+    for (const line of text.split('\n')) {
+      if (!line.includes('"usage"')) continue;
+      let e;
+      try { e = JSON.parse(line); } catch { continue; }
+      const u = e.message?.usage;
+      if (u) byMsg.set(e.message.id ?? e.uuid, u);
+    }
+  }
+  if (!read) return null;
+  const t = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+  for (const u of byMsg.values()) {
+    t.input += u.input_tokens || 0;
+    t.output += u.output_tokens || 0;
+    t.cacheRead += u.cache_read_input_tokens || 0;
+    t.cacheWrite += u.cache_creation_input_tokens || 0;
+  }
+  return t;
+}
+
+/** Stop: report this session's cumulative token usage to the bus (silent, never blocks). */
+export async function stopHook() {
+  if (!process.env.BUS_AGENT) return 0;
+  const input = await readStdin();
+  if (!input.transcript_path) return 0;
+  const totals = transcriptUsage(input.transcript_path, input.session_id);
+  if (!totals) return 0;
+  try { await request('POST', '/api/usage', { body: { session: input.session_id || input.transcript_path, ...totals }, timeoutMs: 1500 }); }
+  catch { /* bus down: usage is simply not recorded */ }
   return 0;
 }
 

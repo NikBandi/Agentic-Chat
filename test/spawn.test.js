@@ -8,7 +8,7 @@ import { execFileSync } from 'node:child_process';
 import { Bus, BusError } from '../src/bus.js';
 import { Store } from '../src/store.js';
 import { Tasks } from '../src/tasks.js';
-import { Spawner, workerPrompt, workerArgs, maxWorkers } from '../src/spawn.js';
+import { Spawner, workerPrompt, workerArgs, maxWorkers, readRun, resumePrompt } from '../src/spawn.js';
 
 const PASS = 'node -e "process.exit(0)"';
 let tmp, repo, bus, tasks, sp, launched, n = 0;
@@ -64,7 +64,10 @@ describe('spawning', () => {
     assert.equal(execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: L.cwd, encoding: 'utf8' }).trim(), 'frontend-1');
     assert.equal(L.env.BUS_AGENT, 'frontend-1');
     assert.equal(L.env.BUS_TEAM, 'frontend');
-    assert.equal(L.env.ECC_HOOK_PROFILE, 'minimal');
+    assert.equal(L.env.ECC_HOOK_PROFILE, undefined); // the bus sets no other tool's settings
+    assert.equal(L.env.BUS_SPAWNED, '1'); // SessionStart rules skipped: the prompt carries them
+    const allow = L.args.slice(L.args.indexOf('--allowedTools') + 1);
+    assert.deepEqual(allow, ['Bash(bus:*)', 'Bash(git:*)', `Bash(${PASS})`]); // bus, git and this task's check only
     assert.equal(L.env.BUS_ROLE, undefined);
     assert.equal(L.env.BUS_PORT, '4477');
     assert.equal(L.args[0], '-p');
@@ -157,7 +160,39 @@ describe('spawning', () => {
     assert.equal(launched.length, 2);
     assert.equal(launched[1].cwd, launched[0].cwd);
     assert.match(launched[1].args[1], /sent back: spacing is off/);
+    assert.equal(launched[1].args.includes('--resume'), false); // no session recorded -> fresh start
     assert.equal(sp.s.spawns['frontend-1'].runs, 2);
+  });
+
+  test('a rejected worker whose session is known is resumed with a one-line prompt; a failed resume falls back to fresh', async () => {
+    const t = feTask();
+    sp.request('fe-lead', t.id);
+    await settle();
+    tasks.take('frontend-1', t.id);
+    assert.equal((await tasks.done('frontend-1', t.id)).ok, true);
+    fs.appendFileSync(launched[0].log, JSON.stringify({ type: 'result', session_id: 'sess-1', total_cost_usd: 0.5, result: 'done' }) + '\n');
+    launched[0].exit(0);
+    await settle();
+    assert.equal(sp.s.spawns['frontend-1'].session, 'sess-1');
+    assert.equal(sp.s.spawns['frontend-1'].cost, 0.5);
+    tasks.reject('you', t.id, 'spacing is off');
+    await settle();
+    const a = launched[1].args;
+    assert.equal(a[a.indexOf('--resume') + 1], 'sess-1');
+    assert.equal(a[1], resumePrompt({ task: t.id, reason: 'spacing is off' }));
+    launched[1].exit(1); // resume wrote no result: forget the session
+    await settle();
+    assert.equal(sp.s.spawns['frontend-1'].session, undefined);
+  });
+
+  test('the "exited unfinished" notice carries the worker\'s last words, not just the log path', async () => {
+    const t = feTask();
+    sp.request('fe-lead', t.id);
+    await settle();
+    fs.appendFileSync(launched[0].log, JSON.stringify({ type: 'result', session_id: 's', result: 'I need @be-1 to export User first' }) + '\n');
+    launched[0].exit(0);
+    await settle();
+    assert.ok(dms('fe-lead').some((m) => m.includes('last words: I need @be-1 to export User first')));
   });
 
   test('stop: kills a running worker (no "unfinished" notice) or cancels a queued one', async () => {
@@ -184,6 +219,35 @@ describe('spawning', () => {
     assert.ok(!bus.s.agents['frontend-1'].inactive);
   });
 
+  test('after merge, a spawned worker\'s worktree and branch are removed; a dirty worktree is kept', async () => {
+    const g = (cwd, ...a) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...a], { cwd, stdio: 'ignore' });
+    const [t1, t2] = [feTask(), feTask()];
+    sp.request('fe-lead', t1.id); sp.request('fe-lead', t2.id);
+    await settle();
+    const [w1, w2] = [launched[0].cwd, launched[1].cwd];
+    for (const [t, wt, who] of [[t1, w1, 'frontend-1'], [t2, w2, 'frontend-2']]) {
+      fs.writeFileSync(path.join(wt, `${who}.txt`), 'x');
+      g(wt, 'add', '.'); g(wt, 'commit', '-q', '-m', who);
+      tasks.take(who, t.id);
+      assert.equal((await tasks.done(who, t.id)).ok, true);
+    }
+    fs.mkdirSync(path.join(w1, '.bus')); fs.writeFileSync(path.join(w1, '.bus', 'x'), 'bus files never block cleanup');
+    fs.writeFileSync(path.join(w2, 'stray.txt'), 'uncommitted work');
+    launched[0].exit(0); launched[1].exit(0);
+    await settle();
+    for (const [t, who] of [[t1, 'frontend-1'], [t2, 'frontend-2']]) {
+      g(repo, 'merge', '-q', '--no-edit', who);
+      tasks.approve('you', t.id);
+      await tasks.merged('fe-lead', t.id);
+    }
+    await settle();
+    assert.equal(fs.existsSync(w1), false);
+    assert.equal(execFileSync('git', ['branch', '--list', 'frontend-1'], { cwd: repo, encoding: 'utf8' }).trim(), '');
+    assert.equal(sp.s.spawns['frontend-1'].cleaned, true);
+    assert.equal(fs.existsSync(w2), true); // uncommitted work is never thrown away
+    assert.ok(bus.s.activity.some((e) => /frontend-2: worktree kept \(1 uncommitted file\)/.test(e.text)));
+  });
+
   test('server restart: workers recorded as running are marked exited', () => {
     bus.s.spawns = { 'frontend-1': { name: 'frontend-1', team: 'frontend', task: 1, status: 'running' } };
     const sp2 = new Spawner(bus, tasks, { repo, launcher: makeLauncher([]), env: {} });
@@ -194,15 +258,35 @@ describe('spawning', () => {
 describe('worker prompt and args', () => {
   test('prompt is short and self-contained', () => {
     const p = workerPrompt({ name: 'frontend-1', team: 'frontend', task: 3 });
-    assert.ok(p.split('\n').length <= 6);
+    assert.ok(p.split('\n').length <= 8);
+    assert.match(p, /never work around it/);
     assert.match(p, /bus join/);
     assert.match(p, /bus task take 3/);
     assert.match(p, /bus task done 3 --report/);
     assert.match(p, /stop/);
   });
-  test('args: print mode, settings, permission mode; optional model and budget', () => {
-    assert.deepEqual(workerArgs('P', 'S', {}), ['-p', 'P', '--settings', 'S', '--permission-mode', 'bypassPermissions']);
-    const a = workerArgs('P', 'S', { BUS_WORKER_MODEL: 'sonnet', BUS_WORKER_BUDGET: '2', BUS_WORKER_PERMISSION: 'acceptEdits' });
-    assert.deepEqual(a.slice(5), ['acceptEdits', '--model', 'sonnet', '--max-budget-usd', '2']);
+  const BASE = ['-p', 'P', '--output-format', 'json', '--settings', 'S', '--strict-mcp-config'];
+  test('args: lean (json, no MCP, project settings, sonnet), acceptEdits + allowlist (bus, git, the check, BUS_WORKER_ALLOW)', () => {
+    assert.deepEqual(workerArgs('P', 'S', {}, { check: 'npm test' }), [...BASE, '--setting-sources', 'project,local',
+      '--permission-mode', 'acceptEdits', '--model', 'sonnet', '--allowedTools', 'Bash(bus:*)', 'Bash(git:*)', 'Bash(npm test)']);
+    const a = workerArgs('P', 'S', { BUS_WORKER_MODEL: 'opus', BUS_WORKER_BUDGET: '2', BUS_WORKER_ALLOW: 'Bash(npx vitest:*), WebFetch' }, { resume: 'sid' });
+    assert.deepEqual(a.slice(BASE.length + 2), ['--permission-mode', 'acceptEdits', '--model', 'opus', '--max-budget-usd', '2', '--resume', 'sid',
+      '--allowedTools', 'Bash(bus:*)', 'Bash(git:*)', 'Bash(npx vitest:*)', 'WebFetch']);
+  });
+  test('opt-outs: bypassPermissions drops the allowlist; model "default" and setting sources "all" pass nothing', () => {
+    assert.deepEqual(workerArgs('P', 'S', { BUS_WORKER_PERMISSION: 'bypassPermissions', BUS_WORKER_MODEL: 'default', BUS_WORKER_SETTING_SOURCES: 'all' }, { check: 'x' }),
+      [...BASE, '--permission-mode', 'bypassPermissions']);
+  });
+  test('readRun: the json result and a short tail, only from this run\'s part of the log', () => {
+    const log = path.join(tmp, `run${++n}.log`);
+    fs.writeFileSync(log, 'old run noise\n');
+    const start = fs.statSync(log).size;
+    fs.appendFileSync(log, 'warning: x\n' + JSON.stringify({ type: 'result', session_id: 's1', total_cost_usd: 0.25, result: 'Blocked:\nneed @be-1 to export User' }) + '\n');
+    const r = readRun(log, start);
+    assert.equal(r.result.session_id, 's1');
+    assert.equal(r.tail, 'Blocked: ⏎ need @be-1 to export User');
+    fs.writeFileSync(log, 'a\nb\nError: boom\n'); // crashed: no result -> last lines
+    assert.deepEqual(readRun(log), { result: null, tail: 'a ⏎ b ⏎ Error: boom' });
+    assert.deepEqual(readRun(path.join(tmp, 'missing.log')), { result: null, tail: '' });
   });
 });

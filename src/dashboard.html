@@ -776,6 +776,11 @@ function renderDrawer() {
   }
   $('drawer').scrollTop = scroll;
 }
+function fmtUsage(u) { // same format as bus.js fmtUsage
+  const read = (u.input || 0) + (u.cacheRead || 0) + (u.cacheWrite || 0);
+  const n = (x) => (x >= 1e6 ? (x / 1e6).toFixed(1) + 'M' : x >= 1e3 ? Math.round(x / 1e3) + 'k' : String(x));
+  return n(read) + ' in (' + (read ? Math.round(((u.cacheRead || 0) / read) * 100) : 0) + '% cached), ' + n(u.output || 0) + ' out';
+}
 function taskDetail(t) {
   const live = t.status !== 'merged' && t.status !== 'dropped';
   const sel = 'ra-task-' + t.id;
@@ -785,6 +790,7 @@ function taskDetail(t) {
     h('div', { class: 'meta' }, chip(t.status), h('span', {}, t.owner || (t.assignee ? '→ ' + t.assignee : 'unassigned')), h('span', {}, 'updated ' + ago(t.updatedAt))),
     t.brief ? h('section', {}, h('h3', {}, 'Brief'), h('p', { class: 'brief' }, t.brief)) : null,
     h('section', {}, h('h3', {}, 'Files'), (t.files || []).length ? h('ul', { class: 'files' }, t.files.map((f) => h('li', {}, f))) : h('p', { class: 'soft' }, 'None')),
+    (t.context || []).length ? h('section', {}, h('h3', {}, 'Read first'), h('ul', { class: 'files' }, t.context.map((f) => h('li', {}, f)))) : null,
     (t.after || []).length ? h('section', {}, h('h3', {}, 'Waits on'), h('p', {}, t.after.map((d) => { const dt = taskById(d); return h('span', { class: 'dep' + (dt && dt.status === 'merged' ? '' : ' waiting'), style: 'margin-right:6px' }, '#' + d + ' ' + (dt ? STATUS_LABEL[dt.status].toLowerCase() : '?')); }))) : null,
     h('section', {}, h('h3', {}, 'Done-check'), h('code', {}, t.check),
       r ? h('p', { style: 'margin-top:8px' }, h('span', { class: r.ok ? 'pass' : 'fail' }, r.ok ? 'Passed' : 'Failed (exit ' + r.code + ')'), h('span', { class: 'soft' }, ' · ' + (t.checkRuns || 1) + ' run' + ((t.checkRuns || 1) === 1 ? '' : 's') + (r.ms != null ? ' · ' + (r.ms / 1000).toFixed(1) + 's' : ''))) : h('p', { class: 'soft', style: 'margin-top:8px' }, 'Not run yet'),
@@ -792,6 +798,7 @@ function taskDetail(t) {
     t.branch || t.commit ? h('section', {}, h('h3', {}, 'Branch'), h('p', { class: 'mono' }, (t.branch || '?') + (t.commit ? ' @ ' + short(t.commit) : ''))) : null,
     t.summary ? h('section', {}, h('h3', {}, 'Summary'), h('p', {}, t.summary)) : null,
     t.report ? h('section', {}, h('h3', {}, 'Report'), h('pre', { class: 'out' }, t.report.text)) : null,
+    t.usage ? h('section', {}, h('h3', {}, 'Tokens'), h('p', { class: 'mono' }, fmtUsage(t.usage))) : null,
     live ? h('section', {}, h('h3', {}, 'Actions'),
       h('form', { class: 'actions', onsubmit: (e) => { e.preventDefault(); api('/api/task/reassign', { id: t.id, to: $(sel).value }); } },
         h('label', { for: sel, class: 'small soft' }, 'Reassign to'),

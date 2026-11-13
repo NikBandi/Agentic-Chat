@@ -9,7 +9,7 @@ import { Store } from '../src/store.js';
 import { Tasks } from '../src/tasks.js';
 import { createServer } from '../src/server.js';
 import { parseReport, messageSummary, fmtDuration, REPORT_MAX_CHARS } from '../src/report.js';
-import { AGENT_RULES } from '../src/init.js';
+import { rulesFor } from '../src/init.js';
 
 const PASS = 'node -e "process.exit(0)"';
 const FAIL = 'node -e "process.exit(3)"';
@@ -36,7 +36,7 @@ describe('--report: at most 3 short lines', () => {
     assert.throws(() => parseReport('ok\n' + 'x'.repeat(REPORT_MAX_CHARS + 1)), { message: `--report line 2 is too long (max ${REPORT_MAX_CHARS} chars)` });
   });
   test('the agent rule asks for it', () => {
-    assert.match(AGENT_RULES, /On bus task done, include --report with up to 3 lines\./);
+    assert.match(rulesFor({ BUS_AGENT: 'a', BUS_TEAM: 't' }), /On bus task done, include --report with up to 3 lines/);
   });
 });
 

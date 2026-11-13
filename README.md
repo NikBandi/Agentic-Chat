@@ -21,8 +21,10 @@ Node 18+, zero dependencies. The server listens only on `127.0.0.1`.
 ```sh
 npm link                       # puts `bus` on your PATH (or run: node bin/bus.js ...)
 bus serve                      # in the main repo; state goes to .bus/state.json
-bus init /path/to/project      # once: adds the edit-guard hook + agent rules to the project
+bus init /path/to/project      # once: adds the bus hooks + pre-commit guard to the project
 ```
+
+`bus init` writes nothing into the project's CLAUDE.md. The agent rules come from a **SessionStart hook**, and only sessions with `BUS_AGENT` set get them; leads get one extra line. Your own sessions, and any session without an identity, load none of them. The hook runs again after a compaction. A rules block left in CLAUDE.md by an older `bus init` is removed.
 
 Start each Claude Code session (for example in an Orca worktree terminal) with an identity:
 
@@ -59,17 +61,31 @@ bus workers          # 3/4 running, plus each worker's status
 bus workers stop frontend-2
 ```
 
-- **Each worker gets its own git worktree** next to the repo (`<repo>-frontend-1`, branch `frontend-1`) and a headless `claude -p` session. Its prompt holds only the task: join, take the task (the brief is its full context), test first, commit, `bus task done --report`. Hooks come from `--settings .bus/worker-settings.json`, so the worktree stays clean, and `ECC_HOOK_PROFILE=minimal` is set.
-- **Token limits:** at most `BUS_MAX_WORKERS` (default **4**, max 16) run at once across the whole bus. Extra spawns queue and start as slots free up, and a task waiting on dependencies doesn't take a slot. A worker **exits as soon as its check passes**, so no session sits idle. Optional: `BUS_WORKER_MODEL` (e.g. `sonnet`) and `BUS_WORKER_BUDGET` (USD per run, `--max-budget-usd`).
-- **Rejected?** The same worker is re-spawned in the same worktree, with the reason in its prompt. If a worker exits without handing its task in, its lead gets one notice with the log path (`.bus/workers/<name>.log`).
+- **Each worker gets its own git worktree** next to the repo (`<repo>-frontend-1`, branch `frontend-1`) and a headless `claude -p` session. Its prompt holds only the task (join, take the task, test first, commit, `bus task done --report`) plus the few rules it needs. It gets no SessionStart rules (`BUS_SPAWNED=1`), so it doesn't pay for them twice. Hooks come from `--settings .bus/worker-settings.json`, so the worktree stays clean.
+- **Lean by default:**
+  - Workers start with `--strict-mcp-config` (no MCP servers) and `--setting-sources project,local`, so they don't load your user-level plugins, hooks or MCP tools. `BUS_WORKER_SETTING_SOURCES=all` loads everything.
+  - The model is `sonnet` unless you set `BUS_WORKER_MODEL`. `BUS_WORKER_MODEL=default` uses the CLI's own default.
+  - `BUS_WORKER_BUDGET` caps each run in USD (`--max-budget-usd`).
+- **Token limits:** at most `BUS_MAX_WORKERS` (default **4**, max 16) run at once across the whole bus. Extra spawns queue and start as slots free up, and a task waiting on dependencies doesn't take a slot. A worker **exits as soon as its check passes**, so no session sits idle.
+- **Rejected?** The worker runs with `--output-format json`, so the bus learns its session id. A rejected task **resumes that same session** (`--resume`) with a one-line prompt holding the reason, so the worker keeps what it already learned about the code. If the session can't be resumed, the next spawn starts fresh in the same worktree.
+- **Exited unfinished?** If a worker exits without handing its task in, its lead gets one notice with the worker's last words (the end of its final message, ≤300 chars) and the log path (`.bus/workers/<name>.log`), so there's usually no need to open the log.
+- **Cleanup:** when a spawned worker's task is merged, its worktree is removed and its branch deleted (`git branch -d`, which refuses an unmerged branch). A worktree with uncommitted work is kept and logged; the bus's own `.bus/` doesn't count as uncommitted.
 - Spawned workers are never offered other tasks and are not flagged inactive after exiting. Merging and approval work exactly as before.
-- **Permissions:** workers run with `--permission-mode bypassPermissions` (they're unattended), still behind the bus edit guard, shell guard and pre-commit guard. Set `BUS_WORKER_PERMISSION=acceptEdits` for a stricter mode (shell commands may then be refused). Starting the command: `BUS_CLAUDE` (default `claude`).
+- **Permissions:** workers run with `--permission-mode acceptEdits`. Edits in the worktree are allowed, but shell commands are limited to an allowlist:
+  - `bus` and `git`
+  - the task's own done-check command
+  - anything in `BUS_WORKER_ALLOW` (comma-separated rules, e.g. `Bash(npx vitest:*),WebFetch`)
+
+  A headless session can't answer a prompt, so anything else is refused. All of this still sits behind the bus edit guard, shell guard and pre-commit guard. `BUS_WORKER_PERMISSION=bypassPermissions` brings back the old unrestricted mode. The command that starts a worker is `BUS_CLAUDE` (default `claude`).
 
 ## How messages reach agents
 
 - `bus send @bob ...` is a DM. `bus send @frontend ...` posts to `#frontend` and mentions the team. `bus send #general ...` is a plain channel post.
 - An agent's inbox (`bus read` / `bus wait`) holds **only** DMs to it and messages that mention `@its-name` or `@its-team`. Plain channel chatter never shows up there; to see it, run `bus log #chan`.
 - Output is one line per message, and long messages are truncated (`bus show <id>` gives the full text). A catch-up shows at most 30 messages.
+- **Short messages arrive in the hook notice itself.** If at most 2 messages are waiting and each is one line of ≤200 chars, the PostToolUse notice carries them (`bus: 12 alice>@bob: rebase on main`) and marks them read. That saves the agent a `bus read` call. Bigger batches get the one-line pointer (`bus: 3 new for you (from @alice) — run: bus read`).
+- **Waiting costs nothing.** The rules tell agents to run `bus wait 3600` in the background (`run_in_background`) and end their turn. Claude Code wakes them when it exits, so no tokens are spent re-running `bus wait`.
+- State keeps the newest 1,000 messages. Older ones move to `.bus/archive.jsonl` (`bus show` on one says it's archived). An inbox never shows more than the newest 30 anyway, so no agent loses anything it would have been shown.
 
 ## Claims
 
@@ -97,6 +113,27 @@ bus task merged 1                       # verifies the commit is in main, releas
 ```
 
 Task states are `open → in_progress → review → approved → merged`, plus `dropped`. A rejection sends the task back to `in_progress`.
+
+### Shared context: `--context` and notes
+
+Re-reading the code to get oriented is the biggest cost of many agents on one codebase. Two things cut it down:
+
+- **`--context a.md,src/lib/db.js`** on `bus task add`: the files a worker should read first. `bus task take` prints them as `read first: …`, so the worker doesn't explore.
+- **Notes:** `bus note add <path> "<≤5 lines, ≤600 chars>"` leaves a short summary of a file or `dir/`. `bus task take` prints the notes on anything overlapping the task's files or context (newest 5), in the same call. So the next agent reads a summary instead of the source.
+  - `bus note <path>` shows one note, and `bus note list` lists the paths.
+  - `bus note rm <path>` removes one (the author or a lead).
+  - Notes show who wrote them and how long ago, so stale ones are easy to spot.
+
+### Token usage (`bus usage`)
+
+`bus init` adds a **Stop hook**. After each turn it reads the session transcript, including subagent transcripts, deduplicating by message id. It reports the session's cumulative token counts to the bus and prints nothing, so it costs no tokens.
+
+The bus adds each increase to the agent and to its current task. Turns after a merge still count toward the task it last held. To see the numbers:
+- `bus usage` lists totals for all agents, each agent and each task, e.g. `tokens: 1.2M in (96% cached), 41k out`.
+- `bus report <id>` ends with the task's line.
+- The dashboard's task panel shows it under **Tokens**.
+
+Spawned workers also record their total run cost in USD from the JSON result, and `bus workers` shows it.
 
 - `bus task done` runs `git status --porcelain` in the worker's worktree first. If anything is uncommitted it refuses with `bus: commit your changes first (N files uncommitted)`, and the check doesn't run. The bus's own `.bus/` folder doesn't count. `--allow-dirty` skips this, and a worktree that isn't a git repo isn't checked at all.
 - **Reports:** `bus task done <id> --report "built X\nproblems: Y\nunfinished: Z"` takes up to 3 short lines (≤160 chars each), separated by real newlines or a literal `\n`. More is refused before the check runs. When the check passes, the bus writes the rest of the report from its own records, at no token cost to agents:
@@ -138,7 +175,8 @@ Run `bus dashboard` (or open the link `bus serve` prints). It's one self-contain
 - `bus hot add package.json package-lock.json`: hot files count as claimed by the lead. Workers ask for changes with `bus request <file> "change"`, and the lead answers with `bus request done|decline <id> ["why"]`.
 - `bus iface add src/types/ --teams frontend,backend`: when an agent edits an interface, it gets a one-time notice telling it to tell the teams that use it. `bus task done` refuses until it has @mentioned those teams.
 - An agent silent for 30 minutes (`BUS_INACTIVE_MIN`) is marked inactive and the lead is told once. An agent blocked in `bus wait` doesn't count as silent. The lead can then `bus task reassign` or `bus release --of <agent> --all`.
-- Hook notices (PostToolUse) are one line, shown once per new batch of messages, and print nothing at all when nothing is waiting.
+- Hook notices (PostToolUse) appear once per new batch of messages. They carry short messages inline, otherwise a one-line pointer, and print nothing at all when nothing is waiting.
+- `bus hot list` and `bus iface list` read small endpoints (`/api/hot`, `/api/iface`), not the whole state.
 
 ## Agent tokens (optional, `BUS_AUTH=1`)
 

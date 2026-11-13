@@ -10,6 +10,32 @@ const NAME_RE = /^[a-z0-9][a-z0-9_-]{0,39}$/;
 const MENTION_RE = /(?<![\w@])@([A-Za-z0-9][\w-]*)/g;
 export const INBOX_CAP = 30;
 const ACTIVITY_CAP = 1000;
+/**
+ * Messages kept in memory/state.json; older ones move to archive.jsonl in batches of ARCHIVE_SLACK. Safe because an
+ * inbox never shows more than the newest INBOX_CAP anyway, so a message 1000 back is one no agent would be shown.
+ */
+export const MESSAGE_KEEP = 1000;
+/** A hook notice carries up to this many single-line messages of up to NOTICE_CHARS each, instead of "run bus read". */
+export const NOTICE_INLINE = 2;
+export const NOTICE_CHARS = 200;
+/** Notes stay short so reading one is far cheaper than reading the code; take shows at most NOTES_ON_TAKE. */
+export const NOTE_MAX = 600;
+export const NOTE_LINES = 5;
+export const NOTES_ON_TAKE = 5;
+const ARCHIVE_SLACK = 200;
+
+export const USAGE_KEYS = ['input', 'output', 'cacheRead', 'cacheWrite'];
+export const zeroUsage = () => ({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
+const addUsage = (into, d) => { for (const k of USAGE_KEYS) into[k] = (into[k] || 0) + (d[k] || 0); };
+
+/** "tokens: 1.2M in (96% cached), 41k out" — everything the model read (fresh + cache) vs what it wrote. */
+export function fmtUsage(u) {
+  if (!u) return '';
+  const read = (u.input || 0) + (u.cacheRead || 0) + (u.cacheWrite || 0);
+  const n = (x) => (x >= 1e6 ? (x / 1e6).toFixed(1) + 'M' : x >= 1e3 ? Math.round(x / 1e3) + 'k' : String(x));
+  const pct = read ? Math.round(((u.cacheRead || 0) / read) * 100) : 0;
+  return `tokens: ${n(read)} in (${pct}% cached), ${n(u.output || 0)} out`;
+}
 
 export class BusError extends Error {
   constructor(msg, status = 400) { super(msg); this.status = status; }
@@ -143,7 +169,7 @@ export class Bus extends EventEmitter {
       if (this.#known(m)) mentions.add(m);
     }
     const msg = { id: ++this.s.seq, ts: Date.now(), from, channel, to: dm, text, mentions: [...mentions] };
-    this.s.messages.push(msg);
+    this.#push(msg);
     if (sender?.ifacePending) { // announcing an interface change = mentioning (or posting to) its consuming teams
       const reached = new Set([...mentions, ...(channel ? [channel.slice(1)] : [])]);
       for (const [p, teams] of Object.entries(sender.ifacePending)) {
@@ -160,10 +186,20 @@ export class Bus extends EventEmitter {
   /** System DM from "bus" (task offers, merges, rejections). Recipient need not have joined yet. */
   notify(to, text) {
     const msg = { id: ++this.s.seq, ts: Date.now(), from: 'bus', channel: null, to: cleanName(to), text, mentions: [] };
-    this.s.messages.push(msg);
+    this.#push(msg);
     this.store.save();
     this.emit('message', msg);
     return msg;
+  }
+
+  /** Append a message; past MESSAGE_KEEP + ARCHIVE_SLACK, move the oldest to the archive file. */
+  #push(msg) {
+    const ms = this.s.messages;
+    ms.push(msg);
+    if (ms.length <= MESSAGE_KEEP + ARCHIVE_SLACK) return;
+    const old = ms.splice(0, ms.length - MESSAGE_KEEP);
+    this.s.archivedThrough = old.at(-1).id;
+    this.store.archive?.(old);
   }
 
   /** Is `msg` addressed to `agent` (DM, @name, @team)? Never the sender's own messages. */
@@ -203,8 +239,14 @@ export class Bus extends EventEmitter {
     const newest = un.at(-1)?.id ?? 0;
     if (un.length && newest > (a.noticed ?? 0)) {
       a.noticed = newest;
-      const from = [...new Set(un.map((m) => '@' + m.from))].slice(0, 3).join(', ');
-      lines.push(`bus: ${un.length} new for you (from ${from}) — run: bus read`);
+      if (un.length <= NOTICE_INLINE && un.every((m) => m.text.length <= NOTICE_CHARS && !m.text.includes('\n'))) {
+        // Short enough to deliver here: saves the agent a `bus read` tool call. Counts as read.
+        for (const m of un) lines.push(`bus: ${m.id} ${m.from}>${m.channel ?? '@' + m.to}: ${m.text}`);
+        a.cursor = newest;
+      } else {
+        const from = [...new Set(un.map((m) => '@' + m.from))].slice(0, 3).join(', ');
+        lines.push(`bus: ${un.length} new for you (from ${from}) — run: bus read`);
+      }
     }
     for (const [p, teams] of Object.entries(a.ifacePending ?? {})) {
       if ((a.ifaceNoticed ??= []).includes(p)) continue;
@@ -228,6 +270,7 @@ export class Bus extends EventEmitter {
 
   show(id) {
     const m = this.s.messages.find((x) => x.id === Number(id));
+    if (!m && Number(id) <= (this.s.archivedThrough ?? 0)) throw new BusError(`message ${id} is archived (.bus/archive.jsonl)`, 404);
     if (!m) throw new BusError(`no message ${id}`, 404);
     return m;
   }
@@ -384,6 +427,69 @@ export class Bus extends EventEmitter {
 
   /** Interface edits not yet announced to all consuming teams. */
   unannounced(name) { return Object.entries(this.s.agents[cleanName(name)]?.ifacePending ?? {}); }
+
+  // ---- notes: short shared knowledge about a file or dir/, so the next agent reads a summary, not the source ----
+
+  noteAdd(who, p, text) {
+    const a = this.#agent(who);
+    p = normPath(p);
+    text = String(text ?? '').trim();
+    if (!p || !text) throw new BusError('usage: bus note add <path> "text"');
+    if (text.length > NOTE_MAX) throw new BusError(`a note is at most ${NOTE_MAX} chars (got ${text.length})`);
+    if (text.split('\n').length > NOTE_LINES) throw new BusError(`a note is at most ${NOTE_LINES} lines`);
+    (this.s.notes ??= {})[p] = { path: p, text, by: a.name, ts: Date.now() };
+    this.log(`${a.name} noted ${p}`);
+    this.store.save();
+    return this.s.notes[p];
+  }
+
+  note(p) {
+    const n = this.s.notes?.[normPath(p)];
+    if (!n) throw new BusError(`no note on ${normPath(p)}`, 404);
+    return n;
+  }
+
+  /** Its author, a lead or the head (or the human) may remove a note. */
+  noteRm(who, p) {
+    const n = this.note(p);
+    if (cleanName(who) !== n.by && !this.isBoss(who)) throw new BusError(`only ${n.by} or a lead can remove the note on ${n.path}`, 403);
+    delete this.s.notes[n.path];
+    this.store.save();
+    return n;
+  }
+
+  notes() { return Object.values(this.s.notes ?? {}); }
+
+  /** Notes on anything overlapping `paths` (a file, its dir, a glob), newest first, capped for `bus task take`. */
+  notesFor(paths, cap = NOTES_ON_TAKE) {
+    const want = paths.map(normPath).filter(Boolean);
+    if (!want.length) return [];
+    return this.notes().filter((n) => want.some((p) => overlaps(p, n.path))).sort((x, y) => y.ts - x.ts).slice(0, cap);
+  }
+
+  // ---- token usage (measured by the Stop hook from the session transcript) ----
+
+  /**
+   * `totals` are a session's cumulative counts. The increase since that session's last report is added to the agent
+   * and to its current task (or the task it last held, for the turns after it was merged). Never sent to inboxes.
+   */
+  recordUsage(name, session, totals = {}) {
+    const a = this.#agent(name);
+    const cur = Object.fromEntries(USAGE_KEYS.map((k) => [k, Math.max(0, Number(totals[k]) || 0)]));
+    session = String(session || 'default').slice(0, 200);
+    a.sessions ??= {};
+    const prev = a.sessions[session] ?? {};
+    const delta = Object.fromEntries(USAGE_KEYS.map((k) => [k, Math.max(0, cur[k] - (prev[k] || 0))]));
+    delete a.sessions[session];
+    a.sessions[session] = cur; // re-insert: most recent last
+    const keys = Object.keys(a.sessions);
+    if (keys.length > 10) delete a.sessions[keys[0]];
+    addUsage((a.usage ??= zeroUsage()), delta);
+    const t = this.s.tasks.find((x) => x.id === (a.task ?? a.lastTask));
+    if (t) addUsage((t.usage ??= zeroUsage()), delta);
+    this.store.save();
+    return { agent: a.usage, task: t?.usage ?? null };
+  }
 
   // ---- inactivity ------------------------------------------------------
 

@@ -34,6 +34,13 @@ export class Store {
     this.timer = setTimeout(() => this.flush(), this.delay);
   }
 
+  /** Append old messages to archive.jsonl next to the state file (dropped when there is no file, e.g. tests). */
+  archive(items) {
+    if (!this.file || !items.length) return;
+    fs.mkdirSync(path.dirname(this.file), { recursive: true });
+    fs.appendFileSync(path.join(path.dirname(this.file), 'archive.jsonl'), items.map((m) => JSON.stringify(m)).join('\n') + '\n');
+  }
+
   flush() {
     clearTimeout(this.timer);
     this.timer = null;

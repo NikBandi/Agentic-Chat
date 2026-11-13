@@ -2,7 +2,7 @@
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
-import { DEFAULT_PORT } from './server.js';
+import { DEFAULT_PORT } from './constants.js';
 import { cleanName } from './bus.js';
 import { readHumanToken } from './human.js';
 

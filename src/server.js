@@ -9,8 +9,9 @@ import { Bus, BusError, HUMAN, cleanName } from './bus.js';
 import { Store } from './store.js';
 import { Tasks } from './tasks.js';
 import { Spawner } from './spawn.js';
+import { DEFAULT_PORT } from './constants.js';
 
-export const DEFAULT_PORT = 4477;
+export { DEFAULT_PORT };
 const MAX_BODY = 256 * 1024;
 const MAX_WAIT_S = 3600;
 
@@ -109,17 +110,30 @@ export function createServer({
       : bus.release(need(who), arr(body.paths), !!body.all)),
     'GET /api/claims': ({ who, q }) => ({ claims: bus.claims(q.get('mine') ? who : null) }),
     'GET /api/check': ({ who, q }) => bus.check(who, q.get('path') || '', { editing: !!q.get('edit') }),
-    'POST /api/hot': ({ who, body }) => ({ hotFiles: body.rm ? bus.hotRm(who, arr(body.paths)) : bus.hotAdd(who, arr(body.paths)) }),
+    'POST /api/usage': ({ who, body }) => bus.recordUsage(need(who), body.session, body),
+    'GET /api/usage': () => ({
+      agents: Object.values(bus.s.agents).filter((a) => a.usage).map(({ name, team, usage }) => ({ name, team, usage })),
+      tasks: bus.s.tasks.filter((t) => t.usage).map(({ id, title, status, usage }) => ({ id, title, status, usage })),
+    }),
+    'GET /api/hot':() => ({ hotFiles: bus.s.hotFiles }), // small reads so the CLI never pulls the whole state
+    'GET /api/iface': () => ({ interfaces: bus.s.interfaces }),
+    'POST /api/hot':({ who, body }) => ({ hotFiles: body.rm ? bus.hotRm(who, arr(body.paths)) : bus.hotAdd(who, arr(body.paths)) }),
     'POST /api/request': ({ who, body }) => ({ request: bus.request(need(who), body.file, body.text) }),
     'POST /api/request/resolve': ({ who, body }) => ({ request: bus.resolveRequest(who, body.id, body.verdict, body.why) }),
     'POST /api/iface': ({ who, body }) => ({ interfaces: body.rm ? bus.ifaceRm(who, body.path) : bus.ifaceAdd(who, body.path, arr(body.teams)) }),
     // `waiting` is live (who is blocked in bus wait right now), never persisted.
     'GET /api/state': () => ({ ...bus.s, tokens: undefined, agents: Object.fromEntries(Object.entries(bus.s.agents).map(([n, a]) => [n, waiters.has(n) ? { ...a, waiting: true } : a])) }),
     'POST /api/wait': waitRoute,
-    'POST /api/task/add': ({ who, body }) => ({ task: tasks.add(who, { ...body, files: arr(body.files), after: arr(body.after) }) }),
+    'POST /api/task/add': ({ who, body }) => ({ task: tasks.add(who, { ...body, files: arr(body.files), context: arr(body.context), after: arr(body.after) }) }),
     'GET /api/task/list': ({ who, q }) => ({ tasks: tasks.list(who, !!q.get('mine')) }),
     'GET /api/task/show': ({ q }) => ({ task: tasks.get(q.get('id')) }),
-    'POST /api/task/take': ({ who, body }) => ({ task: tasks.take(need(who), body.id) }),
+    'POST /api/task/take': ({ who, body }) => {
+      const task = tasks.take(need(who), body.id);
+      return { task, notes: bus.notesFor([...task.files, ...(task.context ?? [])]) }; // shown with the brief: no extra calls
+    },
+    'POST /api/note': ({ who, body }) => ({ note: body.rm ? bus.noteRm(who, body.path) : bus.noteAdd(need(who), body.path, body.text) }),
+    'GET /api/note': ({ q }) => ({ note: bus.note(q.get('path') || '') }),
+    'GET /api/notes': () => ({ notes: bus.notes().map(({ path: p, by, ts }) => ({ path: p, by, ts })) }),
     'POST /api/task/done': ({ who, body }) => tasks.done(need(who), body.id, body.summary, { allowDirty: !!body.allowDirty, report: body.report }),
     'GET /api/task/report': ({ who, q }) => ({ report: tasks.report(who, q.get('id')) }),
     'POST /api/task/merged': async ({ who, body }) => ({ task: await tasks.merged(who, body.id, { force: !!body.force }) }),

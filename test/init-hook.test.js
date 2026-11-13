@@ -5,8 +5,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { mergeSettings, mergeClaudeMd, init, AGENT_RULES } from '../src/init.js';
+import { mergeSettings, stripClaudeMd, init, rulesFor } from '../src/init.js';
 import { createServer } from '../src/server.js';
+import { transcriptUsage } from '../src/hooks.js';
+import { fmtUsage } from '../src/bus.js';
 
 const BIN = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'bin', 'bus.js');
 
@@ -24,27 +26,29 @@ describe('bus init', () => {
     assert.match(s.hooks.PostToolUse[0].hooks[0].command, / hook post$/);
   });
 
-  test('mergeClaudeMd appends once and replaces between markers', () => {
-    const once = mergeClaudeMd('# Proj\n\nnotes\n');
-    assert.match(once, /^# Proj\n\nnotes\n\n<!-- agent-bus -->/);
-    assert.equal(mergeClaudeMd(once), once);
-    const stale = '# P\n<!-- agent-bus -->\nold\n<!-- /agent-bus -->\ntail\n';
-    const fresh = mergeClaudeMd(stale);
-    assert.ok(!fresh.includes('\nold\n') && fresh.endsWith('tail\n'));
+  test('stripClaudeMd removes an old agent-rules block and nothing else', () => {
+    assert.equal(stripClaudeMd('# P\n\n<!-- agent-bus -->\nold\n<!-- /agent-bus -->\n\ntail\n'), '# P\n\ntail\n');
+    assert.equal(stripClaudeMd('# P\n'), '# P\n');
   });
 
-  test('agent rules: commit before done, lead merges the sha plainly, block stays ~10 lines', () => {
-    assert.match(AGENT_RULES, /^- Commit your work on your branch before bus task done\.$/m);
-    assert.match(AGENT_RULES, /^- Leads: .*Merge with plain `git merge <sha>` — no squash or rebase\.$/m);
-    assert.ok(AGENT_RULES.split('\n').length <= 12, 'rules block (incl. markers) must stay short');
+  test('rules: only for agents; workers get no lead line; leads do; stays short', () => {
+    assert.equal(rulesFor({}), '');
+    const w = rulesFor({ BUS_AGENT: 'fe-1', BUS_TEAM: 'frontend' });
+    assert.match(w, /^Agent bus: you are fe-1 on team frontend\./);
+    assert.match(w, /^- Commit your work on your branch before bus task done\./m);
+    assert.ok(!/^- Leads:/m.test(w));
+    const l = rulesFor({ BUS_AGENT: 'fe-lead', BUS_TEAM: 'frontend', BUS_ROLE: 'lead' });
+    assert.match(l, /^- Leads: .*Merge with plain `git merge <sha>` — no squash or rebase\.$/m);
+    assert.ok(l.split('\n').length <= 10, 'rules must stay short');
   });
 
-  test('init writes files and refuses invalid settings JSON', () => {
+  test('init writes settings (incl. SessionStart/Stop hooks), never adds rules to CLAUDE.md, refuses invalid JSON', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bus-init-'));
     try {
       init(dir);
-      assert.ok(JSON.parse(fs.readFileSync(path.join(dir, '.claude', 'settings.json'), 'utf8')).hooks.PreToolUse);
-      assert.match(fs.readFileSync(path.join(dir, 'CLAUDE.md'), 'utf8'), /agent-bus/);
+      const s = JSON.parse(fs.readFileSync(path.join(dir, '.claude', 'settings.json'), 'utf8'));
+      assert.ok(s.hooks.PreToolUse && s.hooks.SessionStart && s.hooks.Stop);
+      assert.equal(fs.existsSync(path.join(dir, 'CLAUDE.md')), false);
       fs.writeFileSync(path.join(dir, '.claude', 'settings.json'), '{oops');
       assert.throws(() => init(dir), /not valid JSON/);
     } finally { fs.rmSync(dir, { recursive: true, force: true }); }
@@ -107,18 +111,76 @@ describe('PreToolUse edit guard', () => {
       }
     });
 
-    test('one additionalContext line per new batch, then silent until something newer', async () => {
+    test('up to 2 short messages are delivered in the notice itself and count as read', async () => {
       srv.bus.send('alice', '@carol', 'hi');
       srv.bus.send('alice', '@qa', 'team ping');
-      const first = await post(carol);
-      const out = JSON.parse(first.stdout);
+      const out = JSON.parse((await post(carol)).stdout);
       assert.equal(out.hookSpecificOutput.hookEventName, 'PostToolUse');
-      assert.match(out.hookSpecificOutput.additionalContext, /^bus: 2 new for you \(from @alice\) — run: bus read$/);
+      assert.match(out.hookSpecificOutput.additionalContext, /^bus: \d+ alice>@carol: hi\nbus: \d+ alice>#qa: team ping$/);
+      assert.equal(srv.bus.pending('carol'), 0);
+      assert.equal((await post(carol)).stdout, '');
+    });
+
+    test('bigger batches: one "run bus read" line per new batch, then silent until something newer', async () => {
+      for (const t of ['a', 'b', 'c']) srv.bus.send('alice', '@carol', t);
+      assert.match(JSON.parse((await post(carol)).stdout).hookSpecificOutput.additionalContext, /^bus: 3 new for you \(from @alice\) — run: bus read$/);
       assert.equal((await post(carol)).stdout, ''); // ignored notice is not repeated
       srv.bus.send('alice', '@carol', 'again');
-      assert.match(JSON.parse((await post(carol)).stdout).hookSpecificOutput.additionalContext, /3 new/);
+      assert.match(JSON.parse((await post(carol)).stdout).hookSpecificOutput.additionalContext, /4 new/);
       srv.bus.read('carol');
-      assert.equal((await post(carol)).stdout, '');
+      srv.bus.send('alice', '@carol', 'x'.repeat(201)); // one long message: pointer, not inline
+      assert.match(JSON.parse((await post(carol)).stdout).hookSpecificOutput.additionalContext, /1 new .* run: bus read/);
+    });
+  });
+
+  describe('SessionStart rules', () => {
+    test('agents get their role\'s rules; the human and spawned workers get nothing', async () => {
+      const w = JSON.parse((await run({ BUS_AGENT: 'fe-1', BUS_TEAM: 'frontend' }, { source: 'startup' }, 'start')).stdout);
+      assert.equal(w.hookSpecificOutput.hookEventName, 'SessionStart');
+      assert.match(w.hookSpecificOutput.additionalContext, /^Agent bus: you are fe-1 on team frontend\./);
+      const l = JSON.parse((await run({ BUS_AGENT: 'fe-lead', BUS_TEAM: 'frontend', BUS_ROLE: 'lead' }, {}, 'start')).stdout);
+      assert.match(l.hookSpecificOutput.additionalContext, /^- Leads:/m);
+      for (const env of [{}, { BUS_AGENT: 'frontend-1', BUS_TEAM: 'frontend', BUS_SPAWNED: '1' }]) {
+        const r = await run(env, {}, 'start');
+        assert.equal(r.status, 0);
+        assert.equal(r.stdout + r.stderr, '');
+      }
+    });
+  });
+
+  describe('Stop hook: token usage', () => {
+    const line = (id, u) => JSON.stringify({ type: 'assistant', message: { id, usage: u } });
+    test('transcriptUsage dedupes by message id and includes subagent transcripts', () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bus-tx-'));
+      try {
+        const f = path.join(dir, 'sess.jsonl');
+        const u1 = { input_tokens: 2, output_tokens: 10, cache_read_input_tokens: 100, cache_creation_input_tokens: 50 };
+        fs.writeFileSync(f, [line('m1', u1), line('m1', u1), '{"type":"user"}', 'not json', line('m2', { input_tokens: 1, output_tokens: 5 })].join('\n'));
+        fs.mkdirSync(path.join(dir, 'sess', 'subagents'), { recursive: true });
+        fs.writeFileSync(path.join(dir, 'sess', 'subagents', 'agent-a.jsonl'), line('m3', { input_tokens: 4, output_tokens: 1 }));
+        assert.deepEqual(transcriptUsage(f, 'sess'), { input: 7, output: 16, cacheRead: 100, cacheWrite: 50 });
+        assert.equal(transcriptUsage(path.join(dir, 'missing.jsonl')), null);
+      } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+    });
+
+    test('the hook posts cumulative totals; the bus adds only the increase, to the agent and its task', async () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bus-tx-'));
+      try {
+        srv.bus.touch('dora', 'qa');
+        const t = srv.tasks.add('you', { title: 'measure', check: 'node -v', assignee: 'dora' });
+        srv.tasks.take('dora', t.id);
+        const f = path.join(dir, 's1.jsonl');
+        const dora = { BUS_AGENT: 'dora', BUS_TEAM: 'qa' };
+        fs.writeFileSync(f, line('m1', { input_tokens: 10, output_tokens: 20 }));
+        let r = await run(dora, { session_id: 's1', transcript_path: f }, 'stop');
+        assert.equal(r.status, 0);
+        assert.equal(r.stdout + r.stderr, ''); // silent: zero tokens
+        fs.appendFileSync(f, '\n' + line('m2', { input_tokens: 5, output_tokens: 1, cache_read_input_tokens: 85 }));
+        r = await run(dora, { session_id: 's1', transcript_path: f }, 'stop');
+        assert.deepEqual(srv.bus.s.agents.dora.usage, { input: 15, output: 21, cacheRead: 85, cacheWrite: 0 });
+        assert.deepEqual(t.usage, srv.bus.s.agents.dora.usage);
+        assert.equal(fmtUsage(t.usage), 'tokens: 100 in (85% cached), 21 out');
+      } finally { fs.rmSync(dir, { recursive: true, force: true }); }
     });
   });
 });

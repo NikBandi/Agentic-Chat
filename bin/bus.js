@@ -5,7 +5,8 @@ import { execFileSync } from 'node:child_process';
 import { spawn } from 'node:child_process';
 import { request, tokenFile, baseUrl } from '../src/client.js';
 import { writeHumanToken, removeHumanToken, readHumanToken, humanTokenFile, openCommand } from '../src/human.js';
-import { createServer, DEFAULT_PORT } from '../src/server.js';
+import { DEFAULT_PORT } from '../src/constants.js'; // not server.js: only `bus serve` should load the server
+import { fmtUsage } from '../src/bus.js';
 
 const TRUNC = 200;
 
@@ -28,11 +29,13 @@ const HELP = `bus — local agent chat, claims and tasks
   bus claims [--mine]
   bus check <path>                      is a file free for you to edit?
   bus pending                           count of unread messages
-  bus task add "title" --files a,b/ --check "cmd" [--after 3,4] [--for agent|team] [--team t]
+  bus task add "title" --files a,b/ --check "cmd" [--context x,y] [--after 3,4] [--for agent|team] [--team t]
                [--brief "text" | --brief-file f] [--timeout secs]          (lead: own team; head)
   bus task list [--mine] | show <id> | take <id>
   bus task done <id> ["summary"] [--report "≤3 lines"] [--allow-dirty]  commit first; runs the done-check -> merge request
   bus report <id>                       the task's report (its lead/head/human)
+  bus usage                             tokens per agent and per task (measured by the Stop hook)
+  bus note add <path> "text" | <path> | list | rm <path>   short shared notes on a file or dir/
   bus task merged <id> [--force]        (its lead/head) after merging; verifies the commit is in main
   bus task reassign <id> <agent> | drop <id>                    (its lead/head/human)
   bus spawn <ids...>                    start a headless worker per task (own worktree; max BUS_MAX_WORKERS=4 at once, rest queue)  (lead/head)
@@ -75,6 +78,7 @@ const commands = {
   async serve(args) {
     const port = Number(takeFlag(args, '--port', true) || process.env.BUS_PORT || DEFAULT_PORT);
     const dataFile = path.resolve(takeFlag(args, '--data', true) || process.env.BUS_DATA || '.bus/state.json');
+    const { createServer } = await import('../src/server.js');
     const srv = createServer({ port, dataFile });
     const p = await srv.listen();
     writeHumanToken(p, srv.humanToken);
@@ -172,7 +176,7 @@ const commands = {
 
   async hot([sub, ...paths]) {
     if (sub === 'list' || !sub) {
-      const { hotFiles } = await request('GET', '/api/state');
+      const { hotFiles } = await request('GET', '/api/hot');
       return console.log(hotFiles.length ? hotFiles.join('\n') : 'no hot files');
     }
     if (!['add', 'rm'].includes(sub)) throw new Error('usage: bus hot add|rm <paths...> | bus hot list');
@@ -193,7 +197,7 @@ const commands = {
 
   async iface([sub, p, ...rest]) {
     if (sub === 'list' || !sub) {
-      const { interfaces } = await request('GET', '/api/state');
+      const { interfaces } = await request('GET', '/api/iface');
       if (!interfaces.length) return console.log('no interfaces');
       for (const i of interfaces) console.log(`${i.path} -> ${i.teams.join(',')}`);
       return;
@@ -221,7 +225,10 @@ const commands = {
 
   async hook([sub]) {
     const hooks = await import('../src/hooks.js');
-    const fn = { pre: hooks.preEdit, post: hooks.postTool, bash: hooks.preBash, commit: () => hooks.preCommit() }[sub];
+    const fn = {
+      pre: hooks.preEdit, post: hooks.postTool, bash: hooks.preBash, commit: () => hooks.preCommit(),
+      start: () => hooks.sessionStart(), stop: hooks.stopHook,
+    }[sub];
     if (!fn) throw new Error(`unknown hook "${sub}"`);
     process.exit(await fn());
   },
@@ -241,7 +248,34 @@ const commands = {
     }
     const { workers, running, max } = await request('GET', '/api/workers');
     console.log(`${running}/${max} running`);
-    for (const w of workers) console.log(`${w.name} ${w.status} #${w.task}${w.note ? ' — ' + w.note : ''}`);
+    for (const w of workers) console.log(`${w.name} ${w.status} #${w.task}${w.cost != null ? ` $${w.cost}` : ''}${w.note ? ' — ' + w.note : ''}`);
+  },
+
+  async note([sub, ...rest]) {
+    if (sub === 'add') {
+      const [p, ...text] = rest;
+      const { note: n } = await request('POST', '/api/note', { body: { path: p, text: text.join(' ') } });
+      return console.log(`noted ${n.path}`);
+    }
+    if (sub === 'rm') {
+      const { note: n } = await request('POST', '/api/note', { body: { path: rest[0], rm: true } });
+      return console.log(`removed note on ${n.path}`);
+    }
+    if (!sub || sub === 'list') {
+      const { notes } = await request('GET', '/api/notes');
+      return console.log(notes.length ? notes.map((n) => `${n.path} (${n.by}, ${ago(n.ts)} ago)`).join('\n') : 'no notes');
+    }
+    console.log(noteLine((await request('GET', '/api/note', { query: { path: sub } })).note));
+  },
+
+  async usage() {
+    const { agents, tasks } = await request('GET', '/api/usage');
+    if (!agents.length) return console.log('no usage recorded yet (the Stop hook reports it after each turn)');
+    const total = {};
+    for (const a of agents) for (const [k, v] of Object.entries(a.usage)) total[k] = (total[k] || 0) + v;
+    console.log(`all agents: ${fmtUsage(total)}`);
+    for (const a of agents) console.log(`${a.name} ${a.team}: ${fmtUsage(a.usage)}`);
+    for (const t of tasks) console.log(`#${t.id} ${t.status} ${t.title}: ${fmtUsage(t.usage)}`);
   },
 
   async report([id]) {
@@ -279,6 +313,8 @@ const commands = {
 
 const csv = (v) => (v ? String(v).split(',').map((s) => s.trim()).filter(Boolean) : []);
 
+const noteLine = (n) => `${n.path} (${n.by}, ${ago(n.ts)} ago): ${n.text.replace(/\s*\n\s*/g, ' ⏎ ')}`;
+
 function taskLine(t) {
   const who = (t.owner || (t.assignee ? '→' + t.assignee : '-')) + (t.team && t.team !== t.assignee ? ' [' + t.team + ']' : '');
   const deps = t.after.length ? ` [after ${t.after.map((d) => '#' + d).join(',')}]` : '';
@@ -289,6 +325,7 @@ function taskDetail(t) {
   return [
     taskLine(t),
     `files: ${t.files.join(' ') || '-'}`,
+    t.context?.length && `read first: ${t.context.join(' ')}`,
     `check: ${t.check}`,
     t.commit && `commit: ${t.commit.slice(0, 7)} on ${t.branch ?? '?'}`,
     t.brief && `\n${t.brief}`,
@@ -299,6 +336,7 @@ const taskCommands = {
   async add(args) {
     const body = {
       files: csv(takeFlag(args, '--files', true)),
+      context: csv(takeFlag(args, '--context', true)),
       check: takeFlag(args, '--check', true),
       after: csv(takeFlag(args, '--after', true)),
       assignee: takeFlag(args, '--for', true),
@@ -323,8 +361,9 @@ const taskCommands = {
   async show([id]) { console.log(taskDetail((await request('GET', '/api/task/show', { query: { id } })).task)); },
 
   async take([id]) {
-    const { task: t } = await request('POST', '/api/task/take', { body: { id } });
+    const { task: t, notes = [] } = await request('POST', '/api/task/take', { body: { id } });
     console.log(`took ${taskDetail(t)}`);
+    if (notes.length) console.log(`\nnotes (by agents before you):\n${notes.map(noteLine).join('\n')}`);
   },
 
   async done(args) {
