@@ -33,7 +33,7 @@ function repo(branch = 'main') {
   return d;
 }
 
-/** Main repo + a worker worktree on branch "feat" (shared refs, like Orca worktrees). */
+/** Main repo + a worker worktree on branch "feat" (shared refs, like any git worktree). */
 function setup(branch = 'main') {
   const main = repo(branch);
   const wt = path.join(tmp, `wt${n}`);

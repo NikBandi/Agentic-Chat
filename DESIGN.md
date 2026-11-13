@@ -15,7 +15,7 @@ A local coordination layer that lets many Claude Code agents work on one codebas
 | **Head + team leads** (optional, `BUS_ROLE`) | One head, one lead per team | For multi-team work, the lead role splits in two. The **head** owns hot files, interfaces and change requests, can manage any team, and reviews and merges tasks a lead owns itself. Each **team lead** (`BUS_ROLE=lead`, with `BUS_TEAM`) plans, reviews and merges only its own team's tasks, and is notified about them. An agent named `lead` without a role is the head. See README "Team leads". |
 | **Worker agents** | Many Claude Code sessions | Each runs in its **own git worktree**, belongs to **one team**, works **one task at a time**. |
 
-The human starts the head and lead sessions (and may start workers) in Orca's terminal with a name and team. Leads may also **spawn workers** themselves (`bus spawn <task>`): one headless Claude session in its own worktree per task, at most `BUS_MAX_WORKERS` (default 4) at once, each exiting once its check passes. See README "Lead-spawned workers".
+The human starts the head and lead sessions (and may start workers) in any terminal or IDE with a name and team. `bus worktree <name> --team <t>` makes a worker's worktree and prints the start command. Leads may also **spawn workers** themselves (`bus spawn <task>`): one headless Claude session in its own worktree per task, at most `BUS_MAX_WORKERS` (default 4) at once, each exiting once its check passes. See README "Lead-spawned workers".
 
 Spawned workers are **lean and scoped**:
 - They load no MCP servers and no user-level settings, and default to the `sonnet` model.
@@ -90,7 +90,10 @@ These are requirements, not nice-to-haves.
 
 ## 5. Files, claims, and worktrees
 
-- **Worktrees:** every worker has its own git worktree/branch, so agents physically can't overwrite each other's files.
+- **Worktrees:** every worker has its own git worktree/branch, so agents physically can't overwrite each other's files. Branches alone aren't enough, because one folder has one checked-out branch.
+  - The bus creates them with plain `git`, in one folder `<repo>.worktrees/<name>` (or `BUS_WORKTREE_DIR`).
+  - It removes a spawned worker's worktree after merge, and any idle one on `bus worktree prune`.
+  - Removal never loses work: dirty worktrees are kept, and unmerged branches stay.
 - **Claims** prevent two branches from changing the same file, so merges stay clean.
 - Claim paths are **repo-relative with forward slashes** (`src/api/users.ts`), so they mean the same thing in every worktree. Case-insensitive on Windows.
 - A claim can be a file, a directory (`src/api/` covers everything inside), or a glob (`src/**/*.css`).
@@ -178,6 +181,8 @@ bus approve <id> | bus reject <id> "why" (human, also via dashboard)
 bus auth reset <agent>                  (human) drop an agent's token when BUS_AUTH=1
 bus note add <path> "≤5 lines" | <path> | list | rm <path>   shared notes on a file or dir/
 bus usage                               tokens per agent and per task
+bus worktree <name> --team <t>          (human/head/team lead) worktree + branch for an agent started by hand
+bus worktree list | prune [--dry-run]   bus-made worktrees; prune removes idle, clean ones (human/head)
 ```
 
 ---
@@ -191,8 +196,8 @@ bus usage                               tokens per agent and per task
 - `bus init` merges its hooks into an existing `.claude/settings.json` without clobbering other settings. The hooks are PreToolUse edit and shell guards, the PostToolUse notice, SessionStart rules and Stop usage. It does **not** write agent rules to CLAUDE.md, because every session in the project would pay for them. It removes a `<!-- agent-bus -->` block left there by an older version.
 - State keeps the newest 1,000 messages; older ones are appended to `archive.jsonl` next to the state file. Because inboxes are capped at 30, no agent loses a message it would have been shown. The CLI and hooks import only small modules (the port lives in `constants.js`); only `bus serve` loads the server.
 
-### Orca overlap — check first
-The project will be developed and run inside the Orca IDE, which already manages worktrees and has its own agent messaging/task handoff. Before building, check what Orca provides and **reuse it rather than rebuild it** (especially worktree creation). The parts that are unique to this project: file claims with edit blocking, mention-only inboxes, done-checks, merge approval, hot-file ownership, and interface alerts.
+### IDE-agnostic
+The bus depends on no IDE. It runs in any terminal, and it creates and removes worktrees itself with plain `git`; earlier versions deferred worktrees to the Orca IDE. The only requirement is that agents are Claude Code sessions, since the guards, notices, rules and usage tracking are Claude Code hooks. The git pre-commit guard and the CLI work for any agent.
 
 ### Suggested build order
 1. Server core: agents/teams, messages with mention-only inbox, claims, persistence

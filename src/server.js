@@ -141,7 +141,10 @@ export function createServer({
     'POST /api/task/drop': ({ who, body }) => ({ task: tasks.drop(who, body.id) }),
     'POST /api/spawn': ({ who, body }) => ({ worker: spawner.request(who, body.id), running: spawner.running().length, max: spawner.max }),
     'POST /api/spawn/stop': ({ who, body }) => ({ worker: spawner.stop(who, body.name) }),
-    'GET /api/workers': () => ({ workers: spawner.list(), running: spawner.running().length, max: spawner.max }),
+    'POST /api/worktree': async ({ who, body }) => ({ worktree: await spawner.createWorktree(who, body.name, body.team) }),
+    'POST /api/worktree/prune': async ({ who, body }) => ({ results: await spawner.prune(who, { dryRun: !!body.dryRun }) }),
+    'GET /api/worktrees': () => spawner.worktrees(),
+    'GET /api/workers':() => ({ workers: spawner.list(), running: spawner.running().length, max: spawner.max }),
     'POST /api/approve': ({ who, body }) => ({ task: tasks.approve(who, body.id) }),
     'POST /api/reject': ({ who, body }) => ({ task: tasks.reject(who, body.id, body.why) }),
   };

@@ -59,7 +59,7 @@ describe('spawning', () => {
     assert.equal(w.status, 'running');
     assert.equal(launched.length, 1);
     const L = launched[0];
-    assert.equal(L.cwd, path.join(tmp, `repo${n}-frontend-1`));
+    assert.equal(L.cwd, path.join(tmp, `repo${n}.worktrees`, 'frontend-1')); // one shared folder next to the repo
     assert.ok(fs.existsSync(L.cwd));
     assert.equal(execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: L.cwd, encoding: 'utf8' }).trim(), 'frontend-1');
     assert.equal(L.env.BUS_AGENT, 'frontend-1');
@@ -248,10 +248,63 @@ describe('spawning', () => {
     assert.ok(bus.s.activity.some((e) => /frontend-2: worktree kept \(1 uncommitted file\)/.test(e.text)));
   });
 
+  test('BUS_WORKTREE_DIR puts worktrees where you choose', async () => {
+    const dir = path.join(tmp, `wt${n}`);
+    const sp2 = new Spawner(bus, tasks, { repo, dataDir: path.join(repo, '.bus'), launcher: makeLauncher(launched), env: { BUS_WORKTREE_DIR: dir } });
+    sp2.request('fe-lead', feTask().id);
+    for (let i = 0; i < 10 && !launched.length; i++) await new Promise((r) => setTimeout(r, 30));
+    assert.equal(launched[0].cwd, path.join(dir, 'frontend-1'));
+  });
+
   test('server restart: workers recorded as running are marked exited', () => {
     bus.s.spawns = { 'frontend-1': { name: 'frontend-1', team: 'frontend', task: 1, status: 'running' } };
     const sp2 = new Spawner(bus, tasks, { repo, launcher: makeLauncher([]), env: {} });
     assert.equal(sp2.running().length, 0);
+  });
+});
+
+describe('bus worktree: agents you start yourself, and prune', () => {
+  const branches = () => execFileSync('git', ['branch', '--format=%(refname:short)'], { cwd: repo, encoding: 'utf8' }).split('\n').filter(Boolean);
+
+  test('creates <repo>.worktrees/<name> on branch <name>; idempotent; only the human, head or that team\'s lead', async () => {
+    const w = await sp.createWorktree('you', 'fe-2', 'frontend');
+    assert.equal(w.path, path.join(tmp, `repo${n}.worktrees`, 'fe-2'));
+    assert.equal(execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: w.path, encoding: 'utf8' }).trim(), 'fe-2');
+    assert.equal((await sp.createWorktree('fe-lead', 'fe-2', 'frontend')).existed, true);
+    await assert.rejects(sp.createWorktree('be-lead', 'fe-3', 'frontend'), (e) => e.status === 403);
+    await assert.rejects(sp.createWorktree('you', 'Bad Name', 'frontend'), /bad name/);
+    await assert.rejects(sp.createWorktree('you', 'fe-lead', 'backend'), /already on team frontend/);
+    assert.deepEqual(sp.worktrees().manual.map((r) => r.name), ['fe-2']);
+  });
+
+  test('prune removes idle clean worktrees, keeps busy, recent and dirty ones, and never deletes unmerged work', async () => {
+    const later = Date.now() + 3_600_000;
+    const idle = await sp.createWorktree('you', 'idle-1', 'frontend');
+    const busy = await sp.createWorktree('you', 'busy-1', 'frontend');
+    const dirty = await sp.createWorktree('you', 'dirty-1', 'frontend');
+    const work = await sp.createWorktree('you', 'work-1', 'frontend');
+    bus.touch('busy-1', 'frontend', busy.path);
+    tasks.take('busy-1', feTask({ assignee: 'busy-1' }).id);
+    fs.writeFileSync(path.join(dirty.path, 'wip.txt'), 'not committed');
+    fs.writeFileSync(path.join(work.path, 'done.txt'), 'committed, not merged');
+    execFileSync('git', ['add', '.'], { cwd: work.path }); execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'x'], { cwd: work.path, stdio: 'ignore' });
+
+    await assert.rejects(sp.prune('fe-lead'), (e) => e.status === 403);
+    const fresh = await sp.prune('you'); // just created: everything kept (grace period, or holding a task)
+    assert.ok(fresh.every((r) => /active in the last|holds task/.test(r.kept)) && fresh.some((r) => /active in the last/.test(r.kept)));
+    const dry = await sp.prune('you', { dryRun: true, now: later });
+    assert.ok(dry.some((r) => r.name === 'idle-1' && r.wouldRemove) && fs.existsSync(idle.path));
+
+    const res = Object.fromEntries((await sp.prune('you', { now: later })).map((r) => [r.name, r]));
+    assert.equal(res['idle-1'].removed, true);
+    assert.equal(res['idle-1'].branchDeleted, true); // never diverged from main
+    assert.match(res['busy-1'].kept, /holds task/);
+    assert.match(res['dirty-1'].kept, /1 uncommitted file/);
+    assert.equal(res['work-1'].removed, true);
+    assert.equal(res['work-1'].branchDeleted, false); // its commits stay on the branch
+    assert.ok(branches().includes('work-1') && !branches().includes('idle-1'));
+    assert.ok(!fs.existsSync(idle.path) && fs.existsSync(dirty.path) && fs.existsSync(busy.path));
+    assert.deepEqual(sp.worktrees().manual.map((r) => r.name).sort(), ['busy-1', 'dirty-1']);
   });
 });
 

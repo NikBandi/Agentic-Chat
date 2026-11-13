@@ -5,10 +5,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn as cpSpawn, execFile } from 'node:child_process';
 import { BusError, cleanName } from './bus.js';
-import { git, mainBranch, uncommitted } from './check.js';
 import { mergeSettings } from './init.js';
+import { addWorktree, removeWorktree, worktreeRoot } from './worktree.js';
 
 export const DEFAULT_MAX = 4;
+/** `bus worktree prune` leaves anything touched this recently alone (an agent may be about to start in it). */
+export const PRUNE_GRACE_MS = 10 * 60_000;
+const NAME_RE = /^[a-z0-9][a-z0-9_-]{0,39}$/;
 export const maxWorkers = (env = process.env) => Math.min(Math.max(1, Number(env.BUS_MAX_WORKERS) || DEFAULT_MAX), 16);
 
 /**
@@ -106,7 +109,7 @@ function launch({ cmd, args, cwd, env, log }) {
 
 export class Spawner {
   /**
-   * repo: the main checkout (worktrees go next to it as <repo>-<agent>). dataDir: logs and worker settings.
+   * repo: the main checkout (worktrees go in <repo>.worktrees/<agent>, or BUS_WORKTREE_DIR). dataDir: logs and worker settings.
    * launcher: injectable for tests. Lifecycle per worker: queued -> running -> exited (re-queued on reject).
    */
   constructor(bus, tasks, { repo = process.cwd(), dataDir = null, launcher = launch, env = process.env, port = null } = {}) {
@@ -114,6 +117,7 @@ export class Spawner {
     this.dataDir = dataDir || path.join(repo, '.bus');
     this.s = bus.s;
     this.s.spawns ??= {};
+    this.s.worktrees ??= {}; // made by `bus worktree` for agents started by hand
     this.procs = new Map(); // name -> handle (this server process only)
     this.pumping = false;
     this.again = false;
@@ -198,14 +202,70 @@ export class Spawner {
     } finally { this.pumping = false; }
   }
 
+  /** A respawn keeps the worktree it had (wherever it was made); a new worker gets <repo>.worktrees/<name>. */
   async #worktree(name) {
-    const wt = path.join(path.dirname(this.repo), `${path.basename(this.repo)}-${name}`);
-    if (fs.existsSync(wt)) return wt; // respawn: keep its branch and commits
-    const main = await mainBranch(this.repo);
-    const exists = (await git(['rev-parse', '--verify', '--quiet', `refs/heads/${name}`], this.repo)).code === 0;
-    const r = await git(exists ? ['worktree', 'add', wt, name] : ['worktree', 'add', '-b', name, wt, main], this.repo);
-    if (r.code !== 0) throw new Error(`git worktree add failed: ${r.err.split('\n')[0]}`);
-    return wt;
+    const old = this.s.spawns[name]?.worktree;
+    if (old && fs.existsSync(old)) return old;
+    return addWorktree(this.repo, name, this.env);
+  }
+
+  // ---- worktrees for agents you start yourself (`bus worktree`), and pruning --------------------------
+
+  /** Create a worktree + branch for an agent the human (or a lead) will start by hand. Idempotent. */
+  async createWorktree(who, name, team) {
+    name = cleanName(name);
+    team = cleanName(team);
+    if (!NAME_RE.test(name) || name === 'bus' || name === 'you') throw new BusError(`bad name "${name}" (use a-z 0-9 _ -)`);
+    if (!team || !NAME_RE.test(team)) throw new BusError('usage: bus worktree <name> --team <team>');
+    if (!this.bus.isBossOf(who, team)) throw new BusError(`only the human, the head or team ${team}'s lead can make worktrees for it`, 403);
+    if (this.s.spawns[name]) throw new BusError(`${name} is a spawned worker — pick another name`, 409);
+    const a = this.s.agents[name];
+    if (a && a.team !== team) throw new BusError(`${name} is already on team ${a.team}`, 409);
+    const rec = this.s.worktrees[name];
+    if (rec && !rec.removed && fs.existsSync(rec.path)) return { ...rec, existed: true };
+    const wt = await addWorktree(this.repo, name, this.env);
+    this.s.worktrees[name] = { name, team, path: wt, by: cleanName(who) || 'you', createdAt: Date.now() };
+    this.bus.log(`worktree for ${name} (${team}) created: ${wt}`);
+    this.bus.store.save();
+    return this.s.worktrees[name];
+  }
+
+  worktrees() {
+    return { root: worktreeRoot(this.repo, this.env), manual: Object.values(this.s.worktrees).filter((r) => !r.removed),
+      spawned: this.list().filter((w) => w.worktree && !w.cleaned).map(({ name, team, status, worktree }) => ({ name, team, status, path: worktree })) };
+  }
+
+  /**
+   * Remove every bus-made worktree that is idle: its agent holds no task, it isn't running, and nothing happened in
+   * it for PRUNE_GRACE_MS. Never loses work: dirty worktrees are kept, and unmerged branches stay (commits included).
+   * Human or head only. dryRun lists what would go.
+   */
+  async prune(who, { dryRun = false, now = Date.now() } = {}) {
+    if (!this.bus.isTop(who)) throw new BusError('only the human or the head can prune worktrees', 403);
+    const cands = [
+      ...this.list().filter((w) => w.worktree && !w.cleaned).map((rec) => ({ rec, kind: 'spawned', name: rec.name, path: rec.worktree, since: rec.endedAt ?? rec.startedAt ?? 0 })),
+      ...Object.values(this.s.worktrees).filter((r) => !r.removed).map((rec) => ({ rec, kind: 'manual', name: rec.name, path: rec.path, since: rec.createdAt ?? 0 })),
+    ];
+    const gone = (c) => { if (c.kind === 'spawned') c.rec.cleaned = true; else c.rec.removed = true; };
+    const out = [];
+    for (const c of cands) {
+      if (!fs.existsSync(c.path)) { if (!dryRun) gone(c); continue; } // removed by hand: just forget it
+      const a = this.s.agents[c.name];
+      const busy = c.kind === 'spawned' && c.rec.status !== 'exited' ? c.rec.status
+        : a?.task ? `holds task #${a.task}`
+        : now - Math.max(a?.lastSeen ?? 0, c.since) < PRUNE_GRACE_MS ? `active in the last ${PRUNE_GRACE_MS / 60000} min` : null;
+      if (busy) { out.push({ name: c.name, path: c.path, kept: busy }); continue; }
+      if (dryRun) { out.push({ name: c.name, path: c.path, wouldRemove: true }); continue; }
+      const r = await removeWorktree(this.repo, c.path, c.name);
+      if (r.removed) gone(c);
+      out.push({ name: c.name, path: c.path, ...(r.removed ? r : { kept: r.reason }) });
+    }
+    if (!dryRun) {
+      const n = out.filter((x) => x.removed).length;
+      if (n) this.bus.log(`pruned ${n} worktree${n === 1 ? '' : 's'}`);
+      this.bus.store.save();
+    }
+    return out;
   }
 
   #settingsFile() {
@@ -271,13 +331,10 @@ export class Spawner {
   async cleanup(name) {
     const w = this.s.spawns[name];
     if (!w || w.status !== 'exited' || w.cleaned || !w.worktree || !fs.existsSync(w.worktree)) return false;
-    const dirty = await uncommitted(w.worktree);
-    if (dirty) { this.bus.log(`${name}: worktree kept (${dirty} uncommitted file${dirty === 1 ? '' : 's'}) — ${w.worktree}`); return false; }
-    const rm = await git(['worktree', 'remove', '--force', w.worktree], this.repo); // --force: only .bus/ can be left (checked above)
-    if (rm.code !== 0) { this.bus.log(`${name}: couldn't remove worktree: ${rm.err.split('\n')[0]}`); return false; }
-    const br = await git(['branch', '-d', name], this.repo);
+    const r = await removeWorktree(this.repo, w.worktree, name);
+    if (!r.removed) { this.bus.log(`${name}: worktree kept (${r.reason}) — ${w.worktree}`); return false; }
     w.cleaned = true;
-    this.bus.log(`${name}: worktree removed${br.code === 0 ? ', branch deleted' : ` (branch kept: ${br.err.split('\n')[0]})`}`);
+    this.bus.log(`${name}: worktree removed${r.branchDeleted ? ', branch deleted' : ` (branch kept: ${r.branchNote})`}`);
     this.bus.store.save();
     return true;
   }

@@ -26,11 +26,19 @@ bus init /path/to/project      # once: adds the bus hooks + pre-commit guard to 
 
 `bus init` writes nothing into the project's CLAUDE.md. The agent rules come from a **SessionStart hook**, and only sessions with `BUS_AGENT` set get them; leads get one extra line. Your own sessions, and any session without an identity, load none of them. The hook runs again after a compaction. A rules block left in CLAUDE.md by an older `bus init` is removed.
 
-Start each Claude Code session (for example in an Orca worktree terminal) with an identity:
+It works in any terminal or IDE: VS Code, JetBrains, Windows Terminal, tmux, anything. The agents must be **Claude Code** sessions, because edit blocking, notices, rules and usage tracking run on Claude Code hooks.
+
+Give each agent you start yourself its own worktree, then start Claude Code there with an identity. `bus worktree` does both steps and prints the command:
 
 ```sh
-BUS_AGENT=frontend-1 BUS_TEAM=frontend claude      # PowerShell: $env:BUS_AGENT='frontend-1'; $env:BUS_TEAM='frontend'; claude
+bus worktree frontend-1 --team frontend
+# created: ../Agentic-Chat.worktrees/frontend-1 (branch frontend-1)
+# start the agent there:
+#   bash:       cd "…/frontend-1" && BUS_AGENT=frontend-1 BUS_TEAM=frontend claude
+#   PowerShell: cd "…/frontend-1"; $env:BUS_AGENT='frontend-1'; $env:BUS_TEAM='frontend'; claude
 ```
+
+Workers need their own worktree because one folder can have only one branch checked out. Agents sharing a folder would see each other's half-finished edits and break each other's test runs.
 
 The lead session uses `BUS_AGENT=lead`. Commands run without `BUS_AGENT` act as the human (`you`).
 
@@ -61,7 +69,7 @@ bus workers          # 3/4 running, plus each worker's status
 bus workers stop frontend-2
 ```
 
-- **Each worker gets its own git worktree** next to the repo (`<repo>-frontend-1`, branch `frontend-1`) and a headless `claude -p` session. Its prompt holds only the task (join, take the task, test first, commit, `bus task done --report`) plus the few rules it needs. It gets no SessionStart rules (`BUS_SPAWNED=1`), so it doesn't pay for them twice. Hooks come from `--settings .bus/worker-settings.json`, so the worktree stays clean.
+- **Each worker gets its own git worktree** (`<repo>.worktrees/frontend-1`, branch `frontend-1`; see "Worktrees" below) and a headless `claude -p` session. Its prompt holds only the task (join, take the task, test first, commit, `bus task done --report`) plus the few rules it needs. It gets no SessionStart rules (`BUS_SPAWNED=1`), so it doesn't pay for them twice. Hooks come from `--settings .bus/worker-settings.json`, so the worktree stays clean.
 - **Lean by default:**
   - Workers start with `--strict-mcp-config` (no MCP servers) and `--setting-sources project,local`, so they don't load your user-level plugins, hooks or MCP tools. `BUS_WORKER_SETTING_SOURCES=all` loads everything.
   - The model is `sonnet` unless you set `BUS_WORKER_MODEL`. `BUS_WORKER_MODEL=default` uses the CLI's own default.
@@ -203,9 +211,21 @@ This is off by default, so existing setups keep working. Start the server with `
 
 Pattern-matching shell commands can always be evaded with enough effort. For real isolation, run agents as a separate OS user or in a container that can't read your home directory.
 
-## Orca
+## Worktrees
 
-Orca already creates worktrees (`orca worktree create`) and launches agents, so the bus doesn't do either. It records each agent's worktree root on `bus join` so that later done-checks run there.
+The bus creates worktrees itself with plain `git worktree`, so no IDE or other tool is needed.
+
+- **Where:** all of them go in one folder next to the repo, `<repo>.worktrees/<name>`, so you see one extra folder instead of one per worker. Set `BUS_WORKTREE_DIR` to put them elsewhere. They're kept outside the repo so test runners and file watchers don't scan them.
+- **Disk:** worktrees share the repo's git history, so each one holds only the checked-out files. Installed dependencies (`node_modules`, virtual environments) are per worktree. If that gets big, a shared package store (pnpm, for example) helps; the bus doesn't manage installs.
+- **Making them:**
+  - `bus spawn` makes one per spawned worker.
+  - `bus worktree <name> --team <t>` makes one for an agent you start yourself (human, the head, or that team's lead). It's idempotent and prints the start command.
+  - `bus worktree list` shows them all.
+- **Removing them:**
+  - A spawned worker's worktree is removed when its task merges.
+  - `bus worktree prune` (human or head) removes every idle bus-made worktree. Idle means its agent holds no task, isn't running, and nothing has happened in it for 10 minutes; `--dry-run` shows what would go.
+  - Removal never loses work. A worktree with uncommitted changes is kept (the bus's own `.bus/` aside). The branch is deleted only if it's merged (`git branch -d`), so unmerged commits stay on their branch. The empty `<repo>.worktrees` folder is removed with the last worktree.
+- `bus join` records each agent's worktree root, so done-checks run there. Agents may also work in worktrees you made some other way, through git or any IDE's worktree feature.
 
 ## Development
 

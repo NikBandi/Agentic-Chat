@@ -7,5 +7,5 @@ A local chat + file-claim + task system so many Claude Code agents can work on o
 Key constraints:
 - Minimal token usage for agents is the top priority. Agents read only what's addressed to them; no polling.
 - Node.js, zero dependencies, runs locally.
-- Developed and run inside the Orca IDE — check what Orca already provides (worktrees, agent messaging) before building it.
+- IDE-agnostic: don't depend on Orca or any IDE feature. The bus must work from any terminal; it manages its own worktrees with plain git. Agents are Claude Code sessions (hooks are required).
 - Follow the build order in DESIGN.md §8.

@@ -40,6 +40,8 @@ const HELP = `bus — local agent chat, claims and tasks
   bus task reassign <id> <agent> | drop <id>                    (its lead/head/human)
   bus spawn <ids...>                    start a headless worker per task (own worktree; max BUS_MAX_WORKERS=4 at once, rest queue)  (lead/head)
   bus workers [stop <name>]             spawned workers: running/queued/exited
+  bus worktree <name> --team <t>        make a worktree + branch for an agent you start yourself; prints the start command
+  bus worktree list | prune [--dry-run] bus-made worktrees; prune removes idle, clean ones   (prune: head/human)
   bus approve <id> | bus reject <id> "why"                      (human)
   bus auth reset <agent>                drop an agent's token (BUS_AUTH=1)  (human)
   bus dashboard [--no-open]             print + open the dashboard link with your token  (human)`;
@@ -239,6 +241,36 @@ const commands = {
       const { worker: w, running, max } = await request('POST', '/api/spawn', { body: { id } });
       console.log(`${w.name} ${w.status === 'running' ? 'started' : w.status} for #${w.task} (${running}/${max} running)`);
     }
+  },
+
+  async worktree(args) {
+    const sub = args[0];
+    if (sub === 'list') {
+      const { root, manual, spawned } = await request('GET', '/api/worktrees');
+      console.log(`root: ${root}`);
+      if (!manual.length && !spawned.length) return console.log('no bus worktrees');
+      for (const r of manual) console.log(`${r.name} ${r.team} ${r.path}`);
+      for (const w of spawned) console.log(`${w.name} ${w.team} ${w.path} (spawned, ${w.status})`);
+      return;
+    }
+    if (sub === 'prune') {
+      const dryRun = takeFlag(args, '--dry-run');
+      const { results } = await request('POST', '/api/worktree/prune', { body: { dryRun } });
+      if (!results.length) return console.log('nothing to prune');
+      for (const r of results) {
+        console.log(r.removed ? `removed ${r.name}${r.branchDeleted ? ' + branch' : ` (branch kept: ${r.branchNote})`}`
+          : r.wouldRemove ? `would remove ${r.name} ${r.path}` : `kept ${r.name}: ${r.kept}`);
+      }
+      return;
+    }
+    const team = takeFlag(args, '--team', true);
+    if (!sub || !team) throw new Error('usage: bus worktree <name> --team <team> | list | prune [--dry-run]');
+    const { worktree: w } = await request('POST', '/api/worktree', { body: { name: sub, team } });
+    const extra = ['BUS_URL', 'BUS_PORT'].filter((k) => process.env[k]);
+    const sh = [`BUS_AGENT=${w.name}`, `BUS_TEAM=${w.team}`, ...extra.map((k) => `${k}=${process.env[k]}`)].join(' ');
+    const ps = [`$env:BUS_AGENT='${w.name}'`, `$env:BUS_TEAM='${w.team}'`, ...extra.map((k) => `$env:${k}='${process.env[k]}'`)].join('; ');
+    console.log(`${w.existed ? 'exists' : 'created'}: ${w.path} (branch ${w.name})`);
+    console.log(`start the agent there:\n  bash:       cd "${w.path}" && ${sh} claude\n  PowerShell: cd "${w.path}"; ${ps}; claude`);
   },
 
   async workers([sub, name]) {
